@@ -10,7 +10,7 @@ except ImportError:  # 允许仓库测试在未安装 ComfyUI/Torch 的 Python �
     torch = None
 
 
-NODE_VERSION = "v0.2.0"
+NODE_VERSION = "v0.2.1"
 REFERENCE_SIZE = 1280
 LARGE_ICON_SIZE = 1280
 SMALL_ICON_SIZE = 168
@@ -150,14 +150,138 @@ def _hard_inset_weight(lateral, start, end, padding):
     return weight
 
 
+def _seeded_8_connected_mask(visible, edge_probe, seed_start, seed_end):
+    """Return all low-alpha runs 8-connected to a confirmed outer-edge seed."""
+    visible = np.asarray(visible, dtype=bool)
+    height, width = visible.shape
+    parent = []
+    rank = []
+    runs = []
+    seeded_ids = set()
+
+    def make_set():
+        identifier = len(parent)
+        parent.append(identifier)
+        rank.append(0)
+        return identifier
+
+    def find(identifier):
+        while parent[identifier] != identifier:
+            parent[identifier] = parent[parent[identifier]]
+            identifier = parent[identifier]
+        return identifier
+
+    def union(first, second):
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        if rank[first_root] < rank[second_root]:
+            first_root, second_root = second_root, first_root
+        parent[second_root] = first_root
+        if rank[first_root] == rank[second_root]:
+            rank[first_root] += 1
+
+    previous = []
+    probe_limit = min(height, max(1, int(edge_probe)))
+    seed_start = max(0, min(width - 1, int(seed_start)))
+    seed_end = max(seed_start, min(width - 1, int(seed_end)))
+    for y in range(height):
+        padded = np.pad(visible[y].astype(np.int8), (1, 1))
+        changes = np.diff(padded)
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+        current = []
+        previous_index = 0
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            identifier = make_set()
+            while (
+                previous_index < len(previous)
+                and previous[previous_index][1] < start - 1
+            ):
+                previous_index += 1
+            overlap_index = previous_index
+            while (
+                overlap_index < len(previous)
+                and previous[overlap_index][0] <= end + 1
+            ):
+                union(identifier, previous[overlap_index][2])
+                overlap_index += 1
+            if y < probe_limit and end >= seed_start and start <= seed_end:
+                seeded_ids.add(identifier)
+            current.append((int(start), int(end), identifier))
+            runs.append((y, int(start), int(end), identifier))
+        previous = current
+
+    mask = np.zeros((height, width), dtype=np.float32)
+    seeded_roots = {find(identifier) for identifier in seeded_ids}
+    for y, start, end, identifier in runs:
+        if find(identifier) in seeded_roots:
+            mask[y, start : end + 1] = 1.0
+    return mask
+
+
+def _oriented_edge_alpha(alpha, side, lower, upper, max_depth):
+    """Return a patch as (inward distance, lateral coordinate)."""
+    height, width = alpha.shape
+    if side == "top":
+        return alpha[:max_depth, lower : upper + 1]
+    if side == "bottom":
+        return alpha[height - max_depth :, lower : upper + 1][::-1, :]
+    if side == "left":
+        return alpha[lower : upper + 1, :max_depth].T
+    return alpha[lower : upper + 1, width - max_depth :][:, ::-1].T
+
+
+def _component_in_edge_layout(component, side):
+    """Map an inward/lateral component mask back to its guard patch layout."""
+    if side == "top":
+        return component
+    if side == "bottom":
+        return component[::-1, :]
+    if side == "left":
+        return component.T
+    return component.T[:, ::-1]
+
+
+def _edge_contact_component(
+    alpha,
+    side,
+    lower,
+    upper,
+    max_depth,
+    start,
+    end,
+    edge_probe,
+    outer_threshold,
+):
+    oriented_alpha = _oriented_edge_alpha(
+        alpha,
+        side,
+        lower,
+        upper,
+        max_depth,
+    )
+    component = _seeded_8_connected_mask(
+        oriented_alpha >= float(outer_threshold),
+        edge_probe,
+        int(start) - lower,
+        int(end) - lower,
+    )
+    return component, _component_in_edge_layout(component, side)
+
+
 def _multiply_bowed_edge_guard(
     guard,
+    alpha,
     side,
     start,
     end,
     hard_zero,
     feather,
     lateral_padding,
+    edge_probe,
+    outer_threshold,
 ):
     height, width = guard.shape
     side_length = width if side in ("top", "bottom") else height
@@ -197,6 +321,19 @@ def _multiply_bowed_edge_guard(
     denominator = np.maximum(float(feather) * feather_scale, 1.0e-6)
     transition = (inward - float(hard_zero) * hard_scale) / denominator
     local[active] = _smootherstep(transition)[active]
+    component, component_2d = _edge_contact_component(
+        alpha,
+        side,
+        lower,
+        upper,
+        max_depth,
+        start,
+        end,
+        edge_probe,
+        outer_threshold,
+    )
+    component_2d = np.broadcast_to(component_2d, local_shape)
+    local = 1.0 - component_2d * (1.0 - local)
 
     if side == "top":
         guard[:max_depth, lower : upper + 1] *= local
@@ -206,6 +343,197 @@ def _multiply_bowed_edge_guard(
         guard[lower : upper + 1, :max_depth] *= local
     else:
         guard[lower : upper + 1, width - max_depth :] *= local
+    return int(np.count_nonzero(component))
+
+
+def _wide_circle_geometry(side_length, normal_length, hard_zero, feather):
+    """Return a gentle virtual circle whose edge arc bends toward canvas center."""
+    lateral_radius = max(0.5, 0.5 * float(side_length - 1))
+    target_sagitta = min(
+        max(1.0, 0.45 * float(feather)),
+        max(1.0, 0.18 * float(normal_length)),
+    )
+    radius = (
+        lateral_radius * lateral_radius + target_sagitta * target_sagitta
+    ) / (2.0 * target_sagitta)
+    # Every point in the local support must be able to reach guard=1 on the
+    # near side of the circle, including at the largest allowed feather.
+    radius = max(
+        radius,
+        lateral_radius + float(hard_zero) + float(feather) + 1.0,
+    )
+    actual_sagitta = radius - np.sqrt(
+        max(radius * radius - lateral_radius * lateral_radius, 0.0)
+    )
+    return lateral_radius, float(radius), float(actual_sagitta)
+
+
+def _multiply_wide_circle_arc_guard(
+    guard,
+    alpha,
+    side,
+    start,
+    end,
+    hard_zero,
+    feather,
+    lateral_padding,
+    edge_probe,
+    outer_threshold,
+):
+    """Multiply one locally gated true-circle arc for a confirmed wide contact."""
+    height, width = guard.shape
+    side_length = width if side in ("top", "bottom") else height
+    normal_length = height if side in ("top", "bottom") else width
+    lower = max(0, int(start) - lateral_padding)
+    upper = min(side_length - 1, int(end) + lateral_padding)
+    lateral = np.arange(lower, upper + 1, dtype=np.float32)
+    support = _hard_inset_weight(lateral, start, end, lateral_padding)
+
+    requested_hard_zero = float(hard_zero)
+    requested_feather = float(feather)
+    center = max(0.5, 0.5 * float(side_length - 1))
+    lateral_offset = lateral - float(center)
+    max_offset = float(np.max(np.abs(lateral_offset[support > 1.0e-6])))
+
+    def resolve_geometry(parameter_scale):
+        effective_hard_zero = requested_hard_zero * float(parameter_scale)
+        effective_feather = max(
+            1.0,
+            requested_feather * float(parameter_scale),
+        )
+        _, local_radius, local_sagitta = _wide_circle_geometry(
+            side_length,
+            normal_length,
+            effective_hard_zero,
+            effective_feather,
+        )
+        inner_radius = (
+            local_radius - effective_hard_zero - effective_feather
+        )
+        radicand = max(
+            inner_radius * inner_radius - max_offset * max_offset,
+            0.0,
+        )
+        completion_depth = local_radius - np.sqrt(radicand)
+        return (
+            effective_hard_zero,
+            effective_feather,
+            local_radius,
+            local_sagitta,
+            float(completion_depth),
+        )
+
+    parameter_scale = 1.0
+    (
+        effective_hard_zero,
+        effective_feather,
+        radius,
+        actual_sagitta,
+        completion_depth,
+    ) = resolve_geometry(parameter_scale)
+    completion_limit = max(1.0, float(normal_length - 2))
+    if completion_depth > completion_limit and normal_length > 2:
+        lower_scale = 0.0
+        upper_scale = 1.0
+        for _ in range(32):
+            candidate_scale = 0.5 * (lower_scale + upper_scale)
+            candidate = resolve_geometry(candidate_scale)
+            if candidate[-1] <= completion_limit:
+                lower_scale = candidate_scale
+            else:
+                upper_scale = candidate_scale
+        parameter_scale = lower_scale
+        (
+            effective_hard_zero,
+            effective_feather,
+            radius,
+            actual_sagitta,
+            completion_depth,
+        ) = resolve_geometry(parameter_scale)
+
+    max_depth = max(
+        1,
+        min(
+            normal_length,
+            int(np.ceil(completion_depth)) + 2,
+        ),
+    )
+
+    component, component_2d = _edge_contact_component(
+        alpha,
+        side,
+        lower,
+        upper,
+        max_depth,
+        start,
+        end,
+        edge_probe,
+        outer_threshold,
+    )
+
+    if side == "top":
+        inward = np.arange(max_depth, dtype=np.float32)[:, None]
+        offset = lateral_offset[None, :]
+        support_2d = support[None, :]
+    elif side == "bottom":
+        inward = np.arange(max_depth - 1, -1, -1, dtype=np.float32)[:, None]
+        offset = lateral_offset[None, :]
+        support_2d = support[None, :]
+    elif side == "left":
+        inward = np.arange(max_depth, dtype=np.float32)[None, :]
+        offset = lateral_offset[:, None]
+        support_2d = support[:, None]
+    else:
+        inward = np.arange(max_depth - 1, -1, -1, dtype=np.float32)[None, :]
+        offset = lateral_offset[:, None]
+        support_2d = support[:, None]
+
+    local_shape = np.broadcast_shapes(inward.shape, offset.shape)
+    inward = np.broadcast_to(inward, local_shape)
+    offset = np.broadcast_to(offset, local_shape)
+    support_2d = np.broadcast_to(support_2d, local_shape)
+    component_2d = np.broadcast_to(component_2d, local_shape)
+    radial_distance = np.sqrt(
+        offset * offset + (float(radius) - inward) ** 2
+    )
+    signed_inside = float(radius) - radial_distance
+    circle = _smootherstep(
+        (signed_inside - effective_hard_zero) / effective_feather
+    )
+    local = 1.0 - support_2d * component_2d * (1.0 - circle)
+
+    contact_offset = max(
+        abs(float(start) - float(center)),
+        abs(float(end) - float(center)),
+    )
+    contact_sagitta = float(radius) - np.sqrt(
+        max(float(radius) ** 2 - contact_offset**2, 0.0)
+    )
+    support_sagitta = float(radius) - np.sqrt(
+        max(float(radius) ** 2 - max_offset**2, 0.0)
+    )
+
+    if side == "top":
+        guard[:max_depth, lower : upper + 1] *= local
+    elif side == "bottom":
+        guard[height - max_depth :, lower : upper + 1] *= local
+    elif side == "left":
+        guard[lower : upper + 1, :max_depth] *= local
+    else:
+        guard[lower : upper + 1, width - max_depth :] *= local
+
+    return {
+        "arc_lateral_center_px": round(float(center), 3),
+        "arc_radius_px": round(float(radius), 3),
+        "arc_canvas_sagitta_px": round(float(actual_sagitta), 3),
+        "arc_contact_sagitta_px": round(float(contact_sagitta), 3),
+        "arc_support_sagitta_px": round(float(support_sagitta), 3),
+        "arc_max_depth_px": int(max_depth),
+        "arc_component_pixels": int(np.count_nonzero(component)),
+        "arc_parameter_scale": round(float(parameter_scale), 6),
+        "arc_effective_hard_zero_px": round(float(effective_hard_zero), 3),
+        "arc_effective_feather_px": round(float(effective_feather), 3),
+    }
 
 
 def _corner_gap(side, segment, corner, height, width):
@@ -239,11 +567,53 @@ def _corner_ellipse_guard(axis_x, axis_y, hard_zero):
     return local
 
 
-def _multiply_corner_guard(guard, corner, axis_x, axis_y, hard_zero):
+def _multiply_corner_guard(
+    guard,
+    alpha,
+    corner,
+    horizontal_side,
+    horizontal,
+    vertical_side,
+    vertical,
+    axis_x,
+    axis_y,
+    hard_zero,
+    edge_probe,
+    outer_threshold,
+):
     height, width = guard.shape
     axis_x = max(1, min(width, int(axis_x)))
     axis_y = max(1, min(height, int(axis_y)))
     local = _corner_ellipse_guard(axis_x, axis_y, hard_zero)
+    visible = _corner_alpha_patch(alpha, corner, axis_x, axis_y) >= float(
+        outer_threshold
+    )
+    horizontal_start, horizontal_end = _corner_run_coordinates(
+        horizontal_side,
+        horizontal,
+        corner,
+        *alpha.shape,
+    )
+    vertical_start, vertical_end = _corner_run_coordinates(
+        vertical_side,
+        vertical,
+        corner,
+        *alpha.shape,
+    )
+    horizontal_component = _seeded_8_connected_mask(
+        visible,
+        edge_probe,
+        horizontal_start,
+        horizontal_end,
+    )
+    vertical_component = _seeded_8_connected_mask(
+        visible.T,
+        edge_probe,
+        vertical_start,
+        vertical_end,
+    ).T
+    component = np.maximum(horizontal_component, vertical_component)
+    local = 1.0 - component * (1.0 - local)
     if corner == "top_left":
         guard[:axis_y, :axis_x] *= local
     elif corner == "top_right":
@@ -252,6 +622,7 @@ def _multiply_corner_guard(guard, corner, axis_x, axis_y, hard_zero):
         guard[height - axis_y :, :axis_x] *= local[::-1, :]
     else:
         guard[height - axis_y :, width - axis_x :] *= local[::-1, ::-1]
+    return int(np.count_nonzero(component))
 
 
 def _corner_alpha_patch(alpha, corner, axis_x, axis_y):
@@ -351,7 +722,7 @@ def build_adaptive_edge_guard(
     feather_width=240,
     contact_threshold=0.03,
 ):
-    """Build smooth local bowed/elliptical guards only for confirmed edge proximity."""
+    """Build local circular/bowed guards only for confirmed outer-edge contact."""
     alpha = np.asarray(alpha, dtype=np.float32)
     if alpha.ndim != 2:
         raise ValueError("alpha 必须是二维灰度数组。")
@@ -490,26 +861,59 @@ def build_adaptive_edge_guard(
             continue
 
         horizontal, vertical, axis_x, axis_y = selected
-        _multiply_corner_guard(guard, corner, axis_x, axis_y, hard_zero)
+        component_pixels = _multiply_corner_guard(
+            guard,
+            alpha,
+            corner,
+            horizontal_side,
+            horizontal,
+            vertical_side,
+            vertical,
+            axis_x,
+            axis_y,
+            hard_zero,
+            edge_probe,
+            outer_threshold,
+        )
         for contact in (horizontal, vertical):
             contact["mode"] = "corner_ellipse"
             contact["corner"] = corner
             contact["corner_axis_px"] = [int(axis_x), int(axis_y)]
+            contact["component_pixels"] = component_pixels
             contact["consumed"] = True
 
     contacts = []
     for side in ("top", "right", "bottom", "left"):
         for contact in contacts_by_side[side]:
             if not contact["consumed"]:
-                _multiply_bowed_edge_guard(
-                    guard,
-                    side,
-                    contact["start"],
-                    contact["end"],
-                    hard_zero,
-                    contact["feather_px"],
-                    lateral_padding,
-                )
+                if contact["wide"]:
+                    arc_diagnostics = _multiply_wide_circle_arc_guard(
+                        guard,
+                        alpha,
+                        side,
+                        contact["start"],
+                        contact["end"],
+                        hard_zero,
+                        contact["feather_px"],
+                        lateral_padding,
+                        edge_probe,
+                        outer_threshold,
+                    )
+                    contact["mode"] = "wide_circle_arc"
+                    contact.update(arc_diagnostics)
+                else:
+                    contact["component_pixels"] = _multiply_bowed_edge_guard(
+                        guard,
+                        alpha,
+                        side,
+                        contact["start"],
+                        contact["end"],
+                        hard_zero,
+                        contact["feather_px"],
+                        lateral_padding,
+                        edge_probe,
+                        outer_threshold,
+                    )
             contact.pop("consumed", None)
             contacts.append(contact)
 
@@ -760,7 +1164,7 @@ class GameUGCAdaptiveEdgeFade:
                 {
                     "batch": batch_index,
                     "node_version": NODE_VERSION,
-                    "diagnostics_schema": "local_curved_v2",
+                    "diagnostics_schema": "local_curved_v3",
                     "input_size": [int(image.shape[1]), int(image.shape[0])],
                     "contacts": contacts,
                 }

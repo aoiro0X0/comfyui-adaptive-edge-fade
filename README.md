@@ -2,14 +2,16 @@
 
 A standalone ComfyUI custom node for repairing foregrounds clipped by the canvas edge.
 
-The node confirms actual outer-edge contact, applies a curved fade only around each contacted component, and emits alpha-safe `1280 × 1280` and `168 × 168` RGBA images in one step. It does not apply a global circle, ellipse, or rounded-square vignette.
+The node confirms actual outer-edge contact, applies a curved fade only around each contacted component, and emits alpha-safe `1280 × 1280` and `168 × 168` RGBA images in one step. Wide contacts follow locally gated true-circle arcs, so their outer contours trend toward one enclosing round silhouette without applying a global circle, ellipse, or rounded-square vignette.
 
 ## Features
 
 - Confirms contact in a narrow outer probe before changing any alpha.
-- Keeps nearby geometry that does not touch the outer probe unchanged.
+- Keeps nearby and disconnected geometry that does not touch the outer probe unchanged.
 - Processes both narrow protrusions and wide clipped bases.
-- Uses per-contact bowed depth envelopes, so wide fades curve inward instead of forming flat rectangular strips.
+- Uses a signed-distance virtual circle for wide contacts: a bottom contour stays farther outward at the center and recedes toward both sides; top, left, and right use the rotationally equivalent rule.
+- Restricts every local field to the low-alpha 8-connected component seeded by its confirmed edge contact, including narrow and connected-corner fades.
+- Keeps narrow protrusions on compact local bowed envelopes.
 - Merges adjacent sides into a local quarter-ellipse only when their alpha belongs to the same connected corner component.
 - Limits tangential influence to each contact's local support; outside that support the guard is exactly `1`.
 - Combines local guards smoothly without hard rectangular projections or `min` seams.
@@ -42,9 +44,9 @@ Adaptive Edge Fade + Alpha-safe 1280/168
 
 If `rgba` already has an alpha channel, the node intersects it with `final_alpha`, so pixels hidden by either source cannot be revived.
 
-## v0.2.0 compatibility
+## v0.2.1 compatibility
 
-The node class, six inputs, and five outputs keep the same names, types, and order as v0.1.1, so existing workflows still load. Saved widget values are also preserved; v0.2.0 changes the visual behavior and uses `8` as the new default `safety_inset`, but an older workflow saved with `32` will continue to use `32` until changed.
+The node class, six inputs, five outputs, names, types, order, and saved widget values are unchanged from v0.2.0, so existing workflows load without rewiring. v0.2.1 changes only the wide-contact geometry and diagnostics: wide fades now follow a true circular trend and do not affect disconnected alpha islands inside the same geometric support.
 
 This node can soften geometry already cut by the canvas boundary; it cannot reconstruct missing off-canvas pixels. If the complete shape must remain visible, scale the subject down or extend the image upstream before matting.
 
@@ -64,4 +66,4 @@ The node uses packages normally included with ComfyUI:
 - NumPy
 - Pillow
 
-Version: `v0.2.0`
+Version: `v0.2.1`
