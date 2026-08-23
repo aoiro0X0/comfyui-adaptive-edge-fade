@@ -4,13 +4,17 @@ A standalone ComfyUI custom node for repairing foregrounds clipped by the canvas
 
 The node uses a precision-first crop-evidence gate, applies a curved fade only around confirmed local cut segments, and emits alpha-safe `1280 × 1280` and `168 × 168` RGBA images in one step. Wide contacts follow locally gated true-circle arcs, so their outer contours trend toward one enclosing round silhouette without applying a global circle, ellipse, or rounded-square vignette.
 
+v0.2.3 also pairs substantial, aligned left/right or top/bottom cuts from the same solid foreground body. The pair receives matching mirrored circle-arc fields and one shared feather depth, preventing the “only one side/half was softened” result while leaving unrelated edge geometry alone.
+
 ## Features
 
 - Uses the narrow outer probe only to discover candidates; contact alone does not trigger a fade.
 - Requires a sufficiently long and dense actual-border core, stable inward support, and persistent width before classifying a segment as a crop cut.
 - Preserves natural tangencies, anti-aliased endings, shallow edge slivers, sparse border residue, and symmetric frame-filling components when crop evidence is ambiguous.
+- Conservatively preserves narrow border chords that widen on both sides. A second evidence band records whether the body keeps widening, closes, or reaches a deep width plateau, but cannot turn this alpha-only ambiguous shape into a confirmed crop.
 - Keeps nearby and disconnected geometry unchanged, even when it lies inside another segment's geometric support.
 - Processes both narrow protrusions and wide clipped bases.
+- Promotes mutually unique, substantial opposite-side cuts to matching `paired_circle_arc` fields only when their robust border intervals align and both contacts lead into the same threshold-solid body.
 - Uses a signed-distance virtual circle for wide contacts: a bottom contour stays farther outward at the center and recedes toward both sides; top, left, and right use the rotationally equivalent rule.
 - Restricts every local field to its exact low-alpha 8-connected component ID.
 - Uses smooth two-dimensional seed ownership when one connected component contains both a confirmed crop and a skipped edge touch, including on adjacent sides.
@@ -47,11 +51,13 @@ Adaptive Edge Fade + Alpha-safe 1280/168
 
 If `rgba` already has an alpha channel, the node intersects it with `final_alpha`, so pixels hidden by either source cannot be revived.
 
-## v0.2.2 compatibility
+## v0.2.3 compatibility
 
-The node class, six inputs, five outputs, names, types, order, and saved widget values are unchanged, so existing workflows load without rewiring. v0.2.2 adds conservative crop-evidence classification, per-component decisions, two-dimensional confirmed/skipped ownership, and rotation-stable corner pairing. Diagnostics use the `clip_evidence_v4` schema and report both confirmed contacts and skipped candidates.
+The node class, six inputs, five outputs, names, types, order, and saved widget values are unchanged, so existing workflows load without rewiring. v0.2.3 adds opposite-side pair promotion, robust-interval alignment, threshold-solid body validation, centerline-safe arc completion for narrow non-square inputs, and conservative bilateral-expansion diagnostics. Diagnostics use the `clip_evidence_v5` schema and report both confirmed contacts and skipped candidates.
 
-This node can soften geometry already cut by the canvas boundary; it cannot reconstruct missing off-canvas pixels. A complete flat edge that naturally ends on the last row can be pixel-identical to the same shape continuing outside the canvas, so no post-crop alpha-only algorithm can distinguish every such case perfectly. v0.2.2 deliberately prefers a false negative over damaging ambiguous edge-touching artwork. Exact overflow classification requires upstream overscan or a per-segment `overflow_seed_mask`.
+This node can soften geometry already cut by the canvas boundary; it cannot reconstruct missing off-canvas pixels. A complete flat edge that naturally ends on the last row can be pixel-identical to the same shape continuing outside the canvas. The same ambiguity exists between a complete round-shouldered tab and a cropped narrow neck after both widen into an identical deep plateau. v0.2.3 deliberately prefers a false negative over damaging such ambiguous edge-touching artwork. Exact overflow classification requires upstream overscan or a per-segment `overflow_seed_mask`.
+
+The release was regression-tested with 77 node tests (one optional Torch smoke test skipped where Torch was unavailable), randomized rotation/mirror checks, and a read-only visual pass over 99 production alpha samples at both 1280 and 168 output sizes.
 
 ## Outputs
 
@@ -69,4 +75,4 @@ The node uses packages normally included with ComfyUI:
 - NumPy
 - Pillow
 
-Version: `v0.2.2`
+Version: `v0.2.3`

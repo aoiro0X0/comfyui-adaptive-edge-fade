@@ -10,7 +10,7 @@ except ImportError:  # 允许仓库测试在未安装 ComfyUI/Torch 的 Python �
     torch = None
 
 
-NODE_VERSION = "v0.2.2"
+NODE_VERSION = "v0.2.3"
 REFERENCE_SIZE = 1280
 LARGE_ICON_SIZE = 1280
 SMALL_ICON_SIZE = 168
@@ -241,9 +241,10 @@ def _edge_segment_clip_evidence(
 
     border_alpha = patch[0]
     seed_profile = np.zeros(patch.shape[1], dtype=bool)
-    seed_profile[
-        seed_start - span_start : seed_end - span_start + 1
-    ] = True
+    if seed_start <= seed_end:
+        seed_profile[
+            seed_start - span_start : seed_end - span_start + 1
+        ] = True
     low_border = (
         component[0]
         & seed_profile
@@ -255,6 +256,8 @@ def _edge_segment_clip_evidence(
         "reason": "actual_border_empty",
         "actual_border_pixels": actual_border_pixels,
         "robust_border_run_px": 0,
+        "robust_global_start": -1,
+        "robust_global_end": -1,
         "robust_core_pixels": 0,
         "robust_hull_coverage": 0.0,
         "border_fill_p25": 0.0,
@@ -268,7 +271,19 @@ def _edge_segment_clip_evidence(
         "weak_right_tail_px": 0,
         "left_expansion_p90_px": 0.0,
         "right_expansion_p90_px": 0.0,
+        "unexplained_left_expansion_p90_px": 0.0,
+        "unexplained_right_expansion_p90_px": 0.0,
         "width_persistence": 0.0,
+        "deep_support_rows": 0,
+        "deep_support_available_rows": 0,
+        "deep_support_coverage": 0.0,
+        "first_band_terminal_width_p90_px": 0.0,
+        "second_band_width_p50_px": 0.0,
+        "second_band_width_p10_px": 0.0,
+        "second_band_width_p90_px": 0.0,
+        "deep_width_growth_px": 0.0,
+        "deep_plateau_tolerance_px": 0.0,
+        "deep_width_plateau": False,
         "evidence_depth_px": int(depth),
     }
     if actual_border_pixels == 0:
@@ -381,6 +396,12 @@ def _edge_segment_clip_evidence(
     metrics.update(
         {
             "robust_border_run_px": robust_run,
+            "robust_global_start": (
+                int(span_start + robust_start) if robust_run > 0 else -1
+            ),
+            "robust_global_end": (
+                int(span_start + robust_end) if robust_run > 0 else -1
+            ),
             "robust_core_pixels": robust_core_pixels,
             "robust_hull_coverage": round(robust_hull_coverage, 6),
             "border_fill_p25": round(border_fill_p25, 6),
@@ -398,6 +419,12 @@ def _edge_segment_clip_evidence(
             "weak_right_tail_px": int(weak_right_tail),
             "left_expansion_p90_px": round(left_expansion_p90, 3),
             "right_expansion_p90_px": round(right_expansion_p90, 3),
+            "unexplained_left_expansion_p90_px": round(
+                unexplained_left, 3
+            ),
+            "unexplained_right_expansion_p90_px": round(
+                unexplained_right, 3
+            ),
             "width_persistence": round(persistence, 6),
         }
     )
@@ -418,6 +445,137 @@ def _edge_segment_clip_evidence(
         or support_prefix_coverage < 0.75
     ):
         metrics["reason"] = "shallow_ambiguous"
+        return False, metrics
+    # A complete rounded object that merely grazes the frame often leaves a
+    # short, apparently solid border chord.  Unlike a stable crop cut, that
+    # chord immediately fans out on *both* tangential sides as we scan inward.
+    # A real cropped wrist/handle can start the same way and can even become a
+    # deep constant-width neck.  Crop-after Alpha cannot distinguish that from
+    # a complete round-shouldered tab, so the second band is diagnostic only:
+    # every narrow bilateral fan remains unchanged. Broad contacts and
+    # one-sided diagonal cuts never enter this conservative ambiguity guard.
+    bilateral_expansion_threshold = max(
+        float(minimum_run),
+        0.18 * float(robust_run),
+    )
+    bilateral_fan = (
+        float(robust_run) / float(side_length) < 0.14
+        and persistence < 0.68
+        and unexplained_left >= bilateral_expansion_threshold
+        and unexplained_right >= bilateral_expansion_threshold
+    )
+    if bilateral_fan:
+        analysis_depth = min(normal_length, 2 * depth)
+        oriented_component = oriented_labels[:analysis_depth] == int(
+            candidate["component_id"]
+        )
+        oriented_core = oriented_component & (
+            oriented[:analysis_depth] >= float(span_threshold)
+        )
+        active = np.zeros(side_length, dtype=bool)
+        active[span_start + robust_start : span_start + robust_end + 1] = (
+            oriented_component[
+                0,
+                span_start + robust_start : span_start + robust_end + 1,
+            ]
+        )
+        monotone_core_widths = np.zeros(analysis_depth, dtype=np.float32)
+        for row_index in range(analysis_depth):
+            if row_index > 0:
+                reachable = active.copy()
+                reachable[1:] |= active[:-1]
+                reachable[:-1] |= active[1:]
+                next_active = np.zeros(side_length, dtype=bool)
+                for segment_start, segment_end in _segments_from_profile(
+                    oriented_component[row_index],
+                    0,
+                ):
+                    if np.any(reachable[segment_start : segment_end + 1]):
+                        next_active[segment_start : segment_end + 1] = True
+                active = next_active
+            core_indexes = np.flatnonzero(
+                active & oriented_core[row_index]
+            )
+            if core_indexes.size:
+                monotone_core_widths[row_index] = float(
+                    core_indexes[-1] - core_indexes[0] + 1
+                )
+
+        terminal_window = max(1, depth // 4)
+        terminal_widths = monotone_core_widths[
+            max(0, depth - terminal_window) : depth
+        ]
+        terminal_widths = terminal_widths[terminal_widths > 0.0]
+        second_widths = monotone_core_widths[depth:analysis_depth]
+        second_positive = second_widths[second_widths > 0.0]
+        second_available = max(0, int(analysis_depth - depth))
+        second_support_rows = int(second_positive.size)
+        second_support_coverage = (
+            float(second_support_rows) / float(second_available)
+            if second_available > 0
+            else 0.0
+        )
+        terminal_width_p90 = (
+            float(np.percentile(terminal_widths, 90))
+            if terminal_widths.size
+            else 0.0
+        )
+        second_width_p50 = (
+            float(np.percentile(second_positive, 50))
+            if second_positive.size
+            else 0.0
+        )
+        second_width_p10 = (
+            float(np.percentile(second_positive, 10))
+            if second_positive.size
+            else 0.0
+        )
+        second_width_p90 = (
+            float(np.percentile(second_positive, 90))
+            if second_positive.size
+            else 0.0
+        )
+        deep_growth = max(
+            0.0,
+            second_width_p90 - terminal_width_p90,
+            terminal_width_p90 - second_width_p10,
+        )
+        plateau_tolerance = max(
+            float(minimum_run),
+            0.25 * float(robust_run),
+        )
+        deep_width_plateau = bool(
+            second_available >= minimum_support_depth
+            and second_support_coverage >= 0.75
+            and deep_growth <= plateau_tolerance
+        )
+        metrics.update(
+            {
+                "deep_support_rows": second_support_rows,
+                "deep_support_available_rows": second_available,
+                "deep_support_coverage": round(
+                    second_support_coverage, 6
+                ),
+                "first_band_terminal_width_p90_px": round(
+                    terminal_width_p90, 3
+                ),
+                "second_band_width_p50_px": round(
+                    second_width_p50, 3
+                ),
+                "second_band_width_p10_px": round(
+                    second_width_p10, 3
+                ),
+                "second_band_width_p90_px": round(
+                    second_width_p90, 3
+                ),
+                "deep_width_growth_px": round(deep_growth, 3),
+                "deep_plateau_tolerance_px": round(
+                    plateau_tolerance, 3
+                ),
+                "deep_width_plateau": deep_width_plateau,
+            }
+        )
+        metrics["reason"] = "ambiguous_bilateral_expansion"
         return False, metrics
     if persistence < 0.55:
         metrics["reason"] = "tangent_expansion"
@@ -564,6 +722,201 @@ def _balanced_frame_flush_evidence(
 def _wide_multiplier(fraction):
     wide_mix = _smootherstep((float(fraction) - 0.35) / 0.45)
     return 1.0 + 0.15 * float(wide_mix)
+
+
+def _promote_paired_opposite_arcs(
+    contacts_by_side,
+    alpha,
+    low_labels,
+    span_threshold,
+    scan_band,
+    height,
+    width,
+    base_feather,
+):
+    """Promote aligned medium opposite cuts to matching circle-arc fields."""
+    minimum_fraction = 0.14
+    minimum_overlap = 0.55
+    maximum_center_offset = 0.12
+    minimum_length_ratio = 0.45
+    minimum_interval_iou = 0.30
+    pair_specs = (
+        ("left", "right", height),
+        ("top", "bottom", width),
+    )
+    core_labels = _label_8_connected_components(alpha >= span_threshold)
+
+    def contact_core_ids(side, contact):
+        start = max(0, int(contact["robust_global_start"]))
+        end = int(contact["robust_global_end"]) + 1
+        if end <= start:
+            return set()
+        oriented_core = _oriented_full_alpha(core_labels, side)
+        oriented_low = _oriented_full_alpha(low_labels, side)
+        normal_depth = min(int(scan_band), oriented_core.shape[0])
+        core_region = oriented_core[:normal_depth, start:end]
+        low_region = oriented_low[:normal_depth, start:end]
+        component_id = int(contact["component_id"])
+        result = set()
+        for lateral_index in range(core_region.shape[1]):
+            core_column = core_region[:, lateral_index]
+            same_component = low_region[:, lateral_index] == component_id
+            first_core = np.flatnonzero(same_component & (core_column > 0))
+            if first_core.size:
+                result.add(int(core_column[int(first_core[0])]))
+        return result
+
+    for first_side, second_side, side_length in pair_specs:
+        candidates = []
+        for first_index, first in enumerate(contacts_by_side[first_side]):
+            for second_index, second in enumerate(
+                contacts_by_side[second_side]
+            ):
+                if first["component_id"] != second["component_id"]:
+                    continue
+                shared_core_ids = contact_core_ids(
+                    first_side, first
+                ).intersection(contact_core_ids(second_side, second))
+                if not shared_core_ids:
+                    continue
+                first_start = int(first["robust_global_start"])
+                first_end = int(first["robust_global_end"])
+                second_start = int(second["robust_global_start"])
+                second_end = int(second["robust_global_end"])
+                if (
+                    first_start < 0
+                    or first_end < first_start
+                    or second_start < 0
+                    or second_end < second_start
+                ):
+                    continue
+                first_length = first_end - first_start + 1
+                second_length = second_end - second_start + 1
+                overlap = max(
+                    0,
+                    min(first_end, second_end)
+                    - max(first_start, second_start)
+                    + 1,
+                )
+                shorter = max(1, min(first_length, second_length))
+                longer = max(1, max(first_length, second_length))
+                overlap_ratio = float(overlap) / float(shorter)
+                length_ratio = float(shorter) / float(longer)
+                interval_union = max(
+                    1,
+                    int(first_length + second_length - overlap),
+                )
+                interval_iou = float(overlap) / float(interval_union)
+                first_center = 0.5 * float(first_start + first_end)
+                second_center = 0.5 * float(second_start + second_end)
+                center_offset = abs(first_center - second_center) / float(
+                    max(1, int(side_length))
+                )
+                minimum_pair_fraction = min(
+                    float(first_length) / float(side_length),
+                    float(second_length) / float(side_length),
+                )
+                if (
+                    minimum_pair_fraction < minimum_fraction
+                    or overlap_ratio < minimum_overlap
+                    or center_offset > maximum_center_offset
+                    or length_ratio < minimum_length_ratio
+                    or interval_iou < minimum_interval_iou
+                ):
+                    continue
+
+                candidates.append(
+                    {
+                        "first_index": first_index,
+                        "second_index": second_index,
+                        "first": first,
+                        "second": second,
+                        "overlap_ratio": overlap_ratio,
+                        "center_offset": center_offset,
+                        "minimum_pair_fraction": minimum_pair_fraction,
+                        "length_ratio": length_ratio,
+                        "interval_iou": interval_iou,
+                        "core_component_id": min(shared_core_ids),
+                        "first_substantive_interval": [
+                            first_start,
+                            first_end,
+                        ],
+                        "second_substantive_interval": [
+                            second_start,
+                            second_end,
+                        ],
+                    }
+                )
+
+        # Pair only mutually unique qualifying matches. This deliberately leaves an
+        # ambiguous one-to-many layout as independent local fields instead of
+        # letting one opposite run promote several unrelated edge segments.
+        first_counts = {}
+        second_counts = {}
+        for candidate in candidates:
+            first_index = candidate["first_index"]
+            second_index = candidate["second_index"]
+            first_counts[first_index] = first_counts.get(first_index, 0) + 1
+            second_counts[second_index] = (
+                second_counts.get(second_index, 0) + 1
+            )
+
+        selected = [
+            candidate
+            for candidate in candidates
+            if first_counts[candidate["first_index"]] == 1
+            and second_counts[candidate["second_index"]] == 1
+        ]
+
+        for candidate in selected:
+            for contact, opposite_side in (
+                (candidate["first"], second_side),
+                (candidate["second"], first_side),
+            ):
+                contact["paired_opposite_arc"] = True
+                contact["paired_opposite_side"] = opposite_side
+                contact["paired_overlap_ratio"] = round(
+                    candidate["overlap_ratio"], 6
+                )
+                contact["paired_center_offset_fraction"] = round(
+                    candidate["center_offset"], 6
+                )
+                contact["paired_min_contact_fraction"] = round(
+                    candidate["minimum_pair_fraction"], 6
+                )
+                contact["paired_length_ratio"] = round(
+                    candidate["length_ratio"], 6
+                )
+                contact["paired_interval_iou"] = round(
+                    candidate["interval_iou"], 6
+                )
+                contact["paired_core_component_id"] = candidate[
+                    "core_component_id"
+                ]
+                contact["paired_substantive_interval"] = (
+                    candidate["first_substantive_interval"]
+                    if contact is candidate["first"]
+                    else candidate["second_substantive_interval"]
+                )
+                contact["paired_arc_min_fraction"] = minimum_fraction
+                contact["paired_arc_min_overlap"] = minimum_overlap
+                contact["paired_arc_max_center_offset"] = (
+                    maximum_center_offset
+                )
+                contact["paired_arc_min_length_ratio"] = minimum_length_ratio
+                contact["paired_arc_min_interval_iou"] = minimum_interval_iou
+
+    for side_contacts in contacts_by_side.values():
+        for contact in side_contacts:
+            if not contact.get("paired_opposite_arc"):
+                continue
+            contact["wide"] = True
+            shared_feather = max(
+                1,
+                int(round(float(base_feather) * 1.15)),
+            )
+            contact["feather_px"] = shared_feather
+            contact["paired_shared_feather_px"] = shared_feather
 
 
 def _interval_distance(coordinates, start, end):
@@ -1017,6 +1370,7 @@ def _multiply_wide_circle_arc_guard(
     component_id=None,
     lateral_ownership=None,
     spatial_ownership=None,
+    paired_opposite=False,
 ):
     """Multiply one locally gated true-circle arc for a confirmed wide contact."""
     height, width = guard.shape
@@ -1069,7 +1423,11 @@ def _multiply_wide_circle_arc_guard(
         actual_sagitta,
         completion_depth,
     ) = resolve_geometry(parameter_scale)
-    completion_limit = max(1.0, float(normal_length - 2))
+    completion_limit = (
+        max(1.0, 0.5 * float(normal_length - 1))
+        if paired_opposite
+        else max(1.0, float(normal_length - 2))
+    )
     if completion_depth > completion_limit and normal_length > 2:
         lower_scale = 0.0
         upper_scale = 1.0
@@ -1196,6 +1554,8 @@ def _multiply_wide_circle_arc_guard(
         "arc_parameter_scale": round(float(parameter_scale), 6),
         "arc_effective_hard_zero_px": round(float(effective_hard_zero), 3),
         "arc_effective_feather_px": round(float(effective_feather), 3),
+        "arc_completion_limit_px": round(float(completion_limit), 3),
+        "arc_paired_opposite": bool(paired_opposite),
     }
 
 
@@ -1612,6 +1972,14 @@ def build_adaptive_edge_guard(
             previous["robust_border_run_px"] += contact[
                 "robust_border_run_px"
             ]
+            previous["robust_global_start"] = min(
+                previous["robust_global_start"],
+                contact["robust_global_start"],
+            )
+            previous["robust_global_end"] = max(
+                previous["robust_global_end"],
+                contact["robust_global_end"],
+            )
             previous["border_fill_p25"] = min(
                 previous["border_fill_p25"], contact["border_fill_p25"]
             )
@@ -1627,6 +1995,17 @@ def build_adaptive_edge_guard(
                 previous["width_persistence"], contact["width_persistence"]
             )
         contacts_by_side[side] = merged_contacts
+
+    _promote_paired_opposite_arcs(
+        contacts_by_side,
+        alpha,
+        labels,
+        span_threshold,
+        scan_band,
+        height,
+        width,
+        base_feather,
+    )
 
     ownership_blend = max(1, int(round(12 * scale)))
     for side in ("top", "right", "bottom", "left"):
@@ -1655,7 +2034,10 @@ def build_adaptive_edge_guard(
     valid_corner_candidates = []
     for corner, (horizontal_side, vertical_side) in corner_pairs.items():
         for horizontal in contacts_by_side[horizontal_side]:
-            if horizontal["length"] > corner_length_limit:
+            if (
+                horizontal["length"] > corner_length_limit
+                or horizontal.get("paired_opposite_arc")
+            ):
                 continue
             horizontal_gap = _corner_gap(
                 horizontal_side, horizontal, corner, height, width
@@ -1665,7 +2047,10 @@ def build_adaptive_edge_guard(
             for vertical in contacts_by_side[vertical_side]:
                 if horizontal["component_id"] != vertical["component_id"]:
                     continue
-                if vertical["length"] > corner_length_limit:
+                if (
+                    vertical["length"] > corner_length_limit
+                    or vertical.get("paired_opposite_arc")
+                ):
                     continue
                 vertical_gap = _corner_gap(
                     vertical_side, vertical, corner, height, width
@@ -1805,8 +2190,13 @@ def build_adaptive_edge_guard(
                         contact["component_id"],
                         contact["_lateral_ownership"],
                         spatial_ownership,
+                        bool(contact.get("paired_opposite_arc")),
                     )
-                    contact["mode"] = "wide_circle_arc"
+                    contact["mode"] = (
+                        "paired_circle_arc"
+                        if contact.get("paired_opposite_arc")
+                        else "wide_circle_arc"
+                    )
                     contact.update(arc_diagnostics)
                 else:
                     contact["component_pixels"] = _multiply_bowed_edge_guard(
@@ -2022,7 +2412,7 @@ class GameUGCAdaptiveEdgeFade:
                         "min": 0.001,
                         "max": 0.5,
                         "step": 0.001,
-                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。贴边、相切、浅层或稀疏边界保持不变。",
+                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。窄弦双向扩张即使形成深宽度平台仍属于不可判贴边并保持不变；同一主体上匹配的左右／上下大段裁断会成对使用同一围合趋势的镜像圆弧羽化。",
                     },
                 ),
                 "rgb_cleanup_alpha": (
@@ -2095,7 +2485,7 @@ class GameUGCAdaptiveEdgeFade:
                 {
                     "batch": batch_index,
                     "node_version": NODE_VERSION,
-                    "diagnostics_schema": "clip_evidence_v4",
+                    "diagnostics_schema": "clip_evidence_v5",
                     "input_size": [int(image.shape[1]), int(image.shape[0])],
                     "contacts": contacts,
                     "skipped_candidates": skipped_candidates,
