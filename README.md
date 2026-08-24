@@ -4,17 +4,20 @@ A standalone ComfyUI custom node for repairing foregrounds clipped by the canvas
 
 The node uses a precision-first crop-evidence gate, applies a curved fade only around confirmed local cut segments, and emits alpha-safe `1280 × 1280` and `168 × 168` RGBA images in one step. Wide contacts follow locally gated true-circle arcs, so their outer contours trend toward one enclosing round silhouette without applying a global circle, ellipse, or rounded-square vignette.
 
-v0.2.4 keeps the paired opposite-edge circle fields from v0.2.3 and changes how their local support closes. Tangential support now contracts the circle's inward depth instead of scaling opacity into constant gray strips, so each contour bends back to the real boundary instead of ending as a rectangular feather block.
+v0.2.5 replaces the two mirrored fields used for opposite cuts with one canvas-centred radial field. A confirmed left/right or top/bottom pair therefore follows the same circle instead of producing two incompatible arcs or rectangular feather blocks. Detection remains precision-first: unrelated edge touches never corroborate each other, and a uniform weak restore halo is rejected only on its own source run rather than suppressing genuine cuts elsewhere on the same subject.
 
 ## Features
 
 - Uses the narrow outer probe only to discover candidates; contact alone does not trigger a fade.
 - Requires a sufficiently long and dense actual-border core, stable inward support, and persistent width before classifying a segment as a crop cut.
+- Keeps every unconfirmed border fragment independent. Multiple fragments and opposite-side touches cannot be merged or used to promote one another into a crop.
 - Preserves natural tangencies, anti-aliased endings, shallow edge slivers, sparse border residue, and symmetric frame-filling components when crop evidence is ambiguous.
+- Rejects nearly uniform low-alpha restore residue that spans almost a whole edge, while leaving stronger or differently valued cuts on the same connected subject eligible for normal detection.
 - Conservatively preserves narrow border chords that widen on both sides. A second evidence band records whether the body keeps widening, closes, or reaches a deep width plateau, but cannot turn this alpha-only ambiguous shape into a confirmed crop.
 - Keeps nearby and disconnected geometry unchanged, even when it lies inside another segment's geometric support.
 - Processes both narrow protrusions and wide clipped bases.
-- Promotes mutually unique, substantial opposite-side cuts to matching `paired_circle_arc` fields only when their robust border intervals align and both contacts lead into the same threshold-solid body.
+- Promotes mutually unique, substantial opposite-side cuts to one shared `paired_circle_arc` field only when their robust border intervals align and both contacts lead into the same threshold-solid body.
+- Fits the shared field to the thinner side's available radial depth and caps its perceptual width, preventing a thick lobe from erasing a thinner opposite handle at `168 × 168`.
 - Uses a signed-distance virtual circle for wide contacts: a bottom contour stays farther outward at the center and recedes toward both sides; top, left, and right use the rotationally equivalent rule.
 - Restricts every local field to its exact low-alpha 8-connected component ID.
 - Uses smooth two-dimensional seed ownership when one connected component contains both a confirmed crop and a skipped edge touch, including on adjacent sides.
@@ -53,13 +56,13 @@ Adaptive Edge Fade + Alpha-safe 1280/168
 
 If `rgba` already has an alpha channel, the node intersects it with `final_alpha`, so pixels hidden by either source cannot be revived.
 
-## v0.2.4 compatibility
+## v0.2.5 compatibility
 
-The node class, six inputs, five outputs, names, types, order, and saved widget values are unchanged, so existing workflows load without rewiring. v0.2.4 replaces opacity-amplitude support with depth-contracted curved support and prevents adjacent micro antialias/probe tails from creating one-pixel ownership seams. Diagnostics use the `clip_evidence_v6` schema; skipped candidates now report `ownership_role` as either `absorbed_micro_fringe` or `blocking_seed`.
+The node class, six inputs, five outputs, names, types, order, and saved widget values are unchanged, so existing workflows load without rewiring. Diagnostics use the `clip_evidence_v7` schema and record shared-circle geometry, effective paired feather width, and precision-first skip reasons including `weak_component_halo` and `balanced_frame_flush`.
 
-This node can soften geometry already cut by the canvas boundary; it cannot reconstruct missing off-canvas pixels. A complete flat edge that naturally ends on the last row can be pixel-identical to the same shape continuing outside the canvas. The same ambiguity exists between a complete round-shouldered tab and a cropped narrow neck after both widen into an identical deep plateau. v0.2.4 deliberately prefers a false negative over damaging such ambiguous edge-touching artwork. Exact overflow classification requires upstream overscan or a per-segment `overflow_seed_mask`.
+This node can soften geometry already cut by the canvas boundary; it cannot reconstruct missing off-canvas pixels. A complete flat edge that naturally ends on the last row can be pixel-identical to the same shape continuing outside the canvas. The same ambiguity exists between a complete round-shouldered tab and a cropped narrow neck after both widen into an identical deep plateau. v0.2.5 deliberately prefers a false negative over damaging such ambiguous edge-touching artwork. Exact overflow classification requires upstream overscan or a per-segment `overflow_seed_mask`.
 
-The release was regression-tested with 80 node tests (one optional Torch smoke test skipped where Torch was unavailable), rotation/mirror and extreme-parameter checks, and a read-only visual pass over 99 production alpha samples at both 1280 and 168 output sizes.
+The release was regression-tested with 92 node tests (one optional Torch smoke test skipped where Torch was unavailable), 130 repository tests in total, rotation/mirror and extreme-parameter checks, and a read-only visual pass over 99 production alpha samples at both 1280 and 168 output sizes. In that sample set, only three images with confirmed cut segments were changed; 96 edge-touching or interior cases kept an all-one edge guard.
 
 ## Outputs
 
@@ -77,4 +80,4 @@ The node uses packages normally included with ComfyUI:
 - NumPy
 - Pillow
 
-Version: `v0.2.4`
+Version: `v0.2.5`

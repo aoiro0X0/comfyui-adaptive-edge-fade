@@ -10,8 +10,8 @@ except ImportError:  # 允许仓库测试在未安装 ComfyUI/Torch 的 Python �
     torch = None
 
 
-NODE_VERSION = "v0.2.4"
-DIAGNOSTICS_SCHEMA = "clip_evidence_v6"
+NODE_VERSION = "v0.2.5"
+DIAGNOSTICS_SCHEMA = "clip_evidence_v7"
 REFERENCE_SIZE = 1280
 LARGE_ICON_SIZE = 1280
 SMALL_ICON_SIZE = 168
@@ -301,6 +301,24 @@ def _edge_segment_clip_evidence(
         peak[has_core], 1.0e-8
     )
     border_fill_p25 = float(np.percentile(relative_edge[has_core], 25))
+    border_peak = float(np.max(border_alpha[has_core]))
+    weak_halo_limit = max(
+        64.0 / 255.0,
+        min(0.25, 4.0 * float(span_threshold)),
+    )
+    if (
+        bool(candidate.get("weak_restore_halo_run", False))
+        and border_peak < weak_halo_limit
+    ):
+        # A restore halo can be broad and locally self-consistent while being
+        # far weaker than the visible body it surrounds.  Classification is
+        # deliberately attached to this uniform border run (or its matching
+        # corner continuation), never to the whole connected component: a
+        # real low-opacity crop elsewhere on that component must still pass
+        # through the normal evidence gate.
+        metrics["reason"] = "weak_component_halo"
+        metrics["border_fill_p25"] = round(border_fill_p25, 6)
+        return False, metrics
     robust = has_core & (relative_edge >= 0.85)
     robust_merge_gap = max(1, int(round(2.0 * float(scale))))
     robust_segments = _segments_from_profile(robust, robust_merge_gap)
@@ -637,8 +655,15 @@ def _balanced_frame_flush_evidence(
         x_min, x_max = int(columns[0]), int(columns[-1])
         bbox_fill_x = float(x_max - x_min + 1) / float(width)
         bbox_fill_y = float(y_max - y_min + 1) / float(height)
-        fills_x = x_min <= probe and width - 1 - x_max <= probe
-        fills_y = y_min <= probe and height - 1 - y_max <= probe
+        frame_margin = max(probe, 2 * probe)
+        fills_x = (
+            x_min <= frame_margin
+            and width - 1 - x_max <= frame_margin
+        )
+        fills_y = (
+            y_min <= frame_margin
+            and height - 1 - y_max <= frame_margin
+        )
         if not (
             fills_x
             and fills_y
@@ -679,6 +704,16 @@ def _balanced_frame_flush_evidence(
         vertical_edge_symmetry = (
             min(vertical_symmetries) if vertical_symmetries else 0.0
         )
+        top_edge_symmetry = _boolean_iou(top_profile, top_profile[::-1])
+        bottom_edge_symmetry = _boolean_iou(
+            bottom_profile,
+            bottom_profile[::-1],
+        )
+        left_edge_symmetry = _boolean_iou(left_profile, left_profile[::-1])
+        right_edge_symmetry = _boolean_iou(
+            right_profile,
+            right_profile[::-1],
+        )
         horizontal_match = (
             has_left_right
             and horizontal_mirror_iou >= 0.76
@@ -691,13 +726,50 @@ def _balanced_frame_flush_evidence(
             and top_bottom_iou >= 0.80
             and vertical_edge_symmetry >= 0.72
         )
-        if not (horizontal_match or vertical_match):
+        # A centred U-shaped emblem frame can intentionally meet the two side
+        # edges and one terminal edge while remaining an intact, symmetric
+        # design.  Its side profiles are not self-symmetric (both descend to
+        # the same terminal edge), so the closed-frame test above cannot
+        # recognize it.  Keep this exemption deliberately strict: the whole
+        # component must still fill both axes, the complete body and opposing
+        # sides must mirror closely, and the terminal edge itself must be
+        # nearly perfectly symmetric.
+        horizontal_u_frame_match = (
+            has_left_right
+            and horizontal_mirror_iou >= 0.85
+            and left_right_iou >= 0.90
+            and max(top_edge_symmetry, bottom_edge_symmetry) >= 0.90
+            and (
+                np.count_nonzero(top_profile) > 0
+                or np.count_nonzero(bottom_profile) > 0
+            )
+        )
+        vertical_u_frame_match = (
+            has_top_bottom
+            and vertical_mirror_iou >= 0.85
+            and top_bottom_iou >= 0.90
+            and max(left_edge_symmetry, right_edge_symmetry) >= 0.90
+            and (
+                np.count_nonzero(left_profile) > 0
+                or np.count_nonzero(right_profile) > 0
+            )
+        )
+        if not (
+            horizontal_match
+            or vertical_match
+            or horizontal_u_frame_match
+            or vertical_u_frame_match
+        ):
             continue
 
         if horizontal_match and vertical_match:
             symmetry_axis = "both"
         elif horizontal_match:
             symmetry_axis = "horizontal"
+        elif horizontal_u_frame_match:
+            symmetry_axis = "horizontal_u_frame"
+        elif vertical_u_frame_match:
+            symmetry_axis = "vertical_u_frame"
         else:
             symmetry_axis = "vertical"
         exemptions[component_id] = {
@@ -716,6 +788,10 @@ def _balanced_frame_flush_evidence(
             "top_bottom_edge_iou": round(top_bottom_iou, 6),
             "horizontal_edge_symmetry": round(horizontal_edge_symmetry, 6),
             "vertical_edge_symmetry": round(vertical_edge_symmetry, 6),
+            "top_edge_symmetry": round(top_edge_symmetry, 6),
+            "bottom_edge_symmetry": round(bottom_edge_symmetry, 6),
+            "left_edge_symmetry": round(left_edge_symmetry, 6),
+            "right_edge_symmetry": round(right_edge_symmetry, 6),
         }
     return exemptions
 
@@ -767,6 +843,7 @@ def _promote_paired_opposite_arcs(
                 result.add(int(core_column[int(first_core[0])]))
         return result
 
+    paired_group_index = 0
     for first_side, second_side, side_length in pair_specs:
         candidates = []
         for first_index, first in enumerate(contacts_by_side[first_side]):
@@ -870,10 +947,15 @@ def _promote_paired_opposite_arcs(
         ]
 
         for candidate in selected:
+            paired_group_index += 1
             for contact, opposite_side in (
                 (candidate["first"], second_side),
                 (candidate["second"], first_side),
             ):
+                contact["_paired_group"] = paired_group_index
+                contact["paired_axis"] = (
+                    "horizontal" if first_side == "left" else "vertical"
+                )
                 contact["paired_opposite_arc"] = True
                 contact["paired_opposite_side"] = opposite_side
                 contact["paired_overlap_ratio"] = round(
@@ -912,10 +994,12 @@ def _promote_paired_opposite_arcs(
             if not contact.get("paired_opposite_arc"):
                 continue
             contact["wide"] = True
-            shared_feather = max(
-                1,
-                int(round(float(base_feather) * 1.15)),
-            )
+            # The paired field later measures how much radial thickness the
+            # actual edge-connected lobe owns.  Keep this value equal to the
+            # user's requested feather instead of silently inflating it: a
+            # 1.15 multiplier made the 168px transition nearly as thick as a
+            # clipped handle and read as a dark wedge.
+            shared_feather = max(1, int(round(float(base_feather))))
             contact["feather_px"] = shared_feather
             contact["paired_shared_feather_px"] = shared_feather
 
@@ -1640,6 +1724,352 @@ def _multiply_wide_circle_arc_guard(
     }
 
 
+def _paired_contact_radial_depths(
+    component_labels,
+    component_id,
+    side,
+    contact,
+):
+    """Measure usable radial thickness in border-connected normal runs."""
+    component = component_labels == int(component_id)
+    oriented = _oriented_full_alpha(component, side)
+    normal_length, lateral_length = oriented.shape
+    normal_center = 0.5 * float(normal_length - 1)
+    lateral_center = 0.5 * float(lateral_length - 1)
+    normal_limit = max(1, min(normal_length, int(np.floor(normal_center)) + 1))
+    start = max(0, int(contact["robust_global_start"]))
+    end = min(lateral_length - 1, int(contact["robust_global_end"]))
+    depths = []
+    for lateral in range(start, end + 1):
+        contiguous = oriented[:normal_limit, lateral]
+        if not bool(contiguous[0]):
+            continue
+        first_gap = np.flatnonzero(~contiguous)
+        run_end = (
+            int(first_gap[0]) - 1
+            if first_gap.size
+            else int(contiguous.size) - 1
+        )
+        if run_end < 0:
+            continue
+        inward = min(float(run_end), normal_center)
+        lateral_offset = float(lateral) - lateral_center
+        boundary_radius = np.hypot(normal_center, lateral_offset)
+        inner_radius = np.hypot(
+            normal_center - inward,
+            lateral_offset,
+        )
+        depths.append(max(0.0, float(boundary_radius - inner_radius)))
+    return depths
+
+
+def _paired_contact_boundary_radius(shape, side, contact):
+    """Closest robust border seed radius around the canvas center."""
+    height, width = shape
+    if side in ("left", "right"):
+        normal_length, lateral_length = width, height
+    else:
+        normal_length, lateral_length = height, width
+    normal_center = 0.5 * float(normal_length - 1)
+    lateral_center = 0.5 * float(lateral_length - 1)
+    start = max(0, int(contact["robust_global_start"]))
+    end = min(lateral_length - 1, int(contact["robust_global_end"]))
+    nearest_lateral = np.clip(lateral_center, float(start), float(end))
+    return float(
+        np.hypot(normal_center, nearest_lateral - lateral_center)
+    )
+
+
+def _paired_seed_labels(
+    band_labels,
+    contacts,
+    edge_probe,
+):
+    seed_labels = []
+    for side, contact in contacts:
+        oriented = _oriented_full_alpha(band_labels, side)
+        probe = min(max(1, int(edge_probe)), oriented.shape[0])
+        start = max(0, int(contact["robust_global_start"]))
+        end = min(
+            oriented.shape[1] - 1,
+            int(contact["robust_global_end"]),
+        )
+        if end < start:
+            continue
+        labels = np.unique(oriented[:probe, start : end + 1])
+        seed_labels.extend(labels[labels > 0].tolist())
+    if not seed_labels:
+        return np.empty((0,), dtype=np.int32)
+    return np.unique(np.asarray(seed_labels, dtype=np.int32))
+
+
+def _force_contact_safety_core(
+    local_guard,
+    component,
+    side,
+    contact,
+    hard_zero,
+    spatial_ownership=None,
+):
+    if hard_zero < 0:
+        return
+    oriented_guard = _oriented_full_alpha(local_guard, side)
+    oriented_component = _oriented_full_alpha(component, side)
+    oriented_ownership = (
+        None
+        if spatial_ownership is None
+        else _oriented_full_alpha(
+            np.clip(
+                np.asarray(spatial_ownership, dtype=np.float32),
+                0.0,
+                1.0,
+            ),
+            side,
+        )
+    )
+    depth = min(oriented_guard.shape[0], int(np.floor(hard_zero)) + 1)
+    start = max(0, int(contact["start"]))
+    end = min(oriented_guard.shape[1] - 1, int(contact["end"]))
+    if depth <= 0 or end < start:
+        return
+    patch = oriented_guard[:depth, start : end + 1]
+    patch_component = oriented_component[:depth, start : end + 1]
+    if oriented_ownership is None:
+        patch[patch_component] = 0.0
+        return
+    patch_ownership = oriented_ownership[:depth, start : end + 1]
+    # A skipped seed owns ambiguous shared pixels even inside the nominal
+    # safety core.  This matches the precision-first ownership rule used by
+    # the other local fields: ownership=1 keeps the exact-zero core, while
+    # ownership=0 leaves the pixel untouched.
+    safety_target = 1.0 - patch_ownership
+    patch[patch_component] = np.minimum(
+        patch[patch_component],
+        safety_target[patch_component],
+    )
+
+
+def _multiply_shared_opposite_circle_guard(
+    guard,
+    alpha,
+    paired_contacts,
+    hard_zero,
+    requested_feather,
+    edge_probe,
+    component_labels,
+    component_id,
+    spatial_ownership=None,
+):
+    """Write one canvas-centred radial field for an opposite-side pair.
+
+    The former paired implementation called the single-edge virtual-circle
+    routine twice.  Those mirrored circles had different centres, so their
+    contours could never close into the one circle perceived at 168px.  This
+    routine creates the radial field once.  Its locality comes from an
+    edge-seeded connected component of the outer transition band: the field
+    naturally ends where it has returned to guard=1, without a rectangular
+    tangential window or a warped support cap.
+    """
+    height, width = guard.shape
+    center_x = 0.5 * float(width - 1)
+    center_y = 0.5 * float(height - 1)
+    component = component_labels == int(component_id)
+
+    boundary_radius = min(
+        _paired_contact_boundary_radius(alpha.shape, side, contact)
+        for side, contact in paired_contacts
+    )
+    available_depth_groups = []
+    for side, contact in paired_contacts:
+        available_depth_groups.append(
+            _paired_contact_radial_depths(
+                component_labels,
+                component_id,
+                side,
+                contact,
+            )
+        )
+    nonempty_depth_groups = [
+        np.asarray(depths, dtype=np.float32)
+        for depths in available_depth_groups
+        if depths
+    ]
+    if nonempty_depth_groups:
+        side_radial_quantiles = np.asarray(
+            [
+                np.percentile(depths, (25.0, 50.0, 75.0))
+                for depths in nonempty_depth_groups
+            ],
+            dtype=np.float32,
+        )
+        # One shared circle must fit the thinner of the two clipped lobes.
+        # A pooled median can be dominated by the thicker side and consume a
+        # thin opposite handle before it ever reaches full opacity.
+        radial_p25, radial_p50, radial_p75 = np.min(
+            side_radial_quantiles,
+            axis=0,
+        ).tolist()
+        side_radial_p50 = side_radial_quantiles[:, 1].tolist()
+    else:
+        radial_p25 = radial_p50 = radial_p75 = float(requested_feather)
+        side_radial_p50 = [float(requested_feather)]
+
+    requested_feather = max(1.0, float(requested_feather))
+    # Smootherstep's visible 10-90% band is about half its nominal width.
+    # Capping the paired nominal band at 1/8 of the reference dimension keeps
+    # that perceptual band near 10px after the 1280 -> 168 icon reduction.
+    perceptual_cap = max(1.0, 0.125 * float(max(height, width)))
+    nominal_feather = min(requested_feather, perceptual_cap)
+    requested_hard_zero = max(0.0, float(hard_zero))
+    radial_budget = max(
+        1.0e-3,
+        min(float(radial_p50), float(boundary_radius)),
+    )
+    if requested_hard_zero < radial_budget:
+        effective_hard_zero = requested_hard_zero
+        effective_feather = max(
+            1.0e-3,
+            min(nominal_feather, radial_budget - effective_hard_zero),
+        )
+        joint_parameter_scale = 1.0
+    else:
+        # Extremely short normal axes can make the scaled safety inset wider
+        # than the whole image.  Scale the safety core and feather together so
+        # the pair still has an interior instead of being erased wholesale.
+        joint_requested = requested_hard_zero + nominal_feather
+        joint_parameter_scale = min(
+            1.0,
+            radial_budget / max(joint_requested, 1.0e-6),
+        )
+        effective_hard_zero = requested_hard_zero * joint_parameter_scale
+        effective_feather = max(
+            1.0e-3,
+            nominal_feather * joint_parameter_scale,
+        )
+
+    y = np.arange(height, dtype=np.float32)[:, None]
+    x = np.arange(width, dtype=np.float32)[None, :]
+    radial_distance = np.sqrt(
+        (x - float(center_x)) ** 2 + (y - float(center_y)) ** 2
+    )
+    radial_guard = _smootherstep(
+        (
+            float(boundary_radius)
+            - radial_distance
+            - float(effective_hard_zero)
+        )
+        / float(effective_feather)
+    ).astype(np.float32)
+
+    transition_band = component & (radial_guard < (1.0 - 1.0e-7))
+    band_labels = _label_8_connected_components(transition_band)
+    seed_labels = _paired_seed_labels(
+        band_labels,
+        paired_contacts,
+        edge_probe,
+    )
+    owned_band = (
+        np.isin(band_labels, seed_labels)
+        if seed_labels.size
+        else np.zeros_like(component, dtype=bool)
+    )
+
+    local_guard = np.ones_like(guard, dtype=np.float32)
+    if spatial_ownership is None:
+        local_guard[owned_band] = radial_guard[owned_band]
+    else:
+        ownership = np.clip(
+            np.asarray(spatial_ownership, dtype=np.float32),
+            0.0,
+            1.0,
+        )
+        local_guard[owned_band] = 1.0 - ownership[owned_band] * (
+            1.0 - radial_guard[owned_band]
+        )
+    for side, contact in paired_contacts:
+        _force_contact_safety_core(
+            local_guard,
+            component,
+            side,
+            contact,
+            effective_hard_zero,
+            spatial_ownership,
+        )
+    guard *= local_guard
+
+    first_side = paired_contacts[0][0]
+    normal_length = width if first_side in ("left", "right") else height
+    lateral_length = height if first_side in ("left", "right") else width
+    normal_center = 0.5 * float(normal_length - 1)
+    lateral_center = 0.5 * float(lateral_length - 1)
+    contact_offset = max(
+        max(
+            abs(float(contact["robust_global_start"]) - lateral_center),
+            abs(float(contact["robust_global_end"]) - lateral_center),
+        )
+        for _, contact in paired_contacts
+    )
+    contact_sagitta = float(boundary_radius) - np.sqrt(
+        max(float(boundary_radius) ** 2 - contact_offset**2, 0.0)
+    )
+    half_alpha_radius = (
+        float(boundary_radius)
+        - float(effective_hard_zero)
+        - 0.5 * float(effective_feather)
+    )
+    parameter_scale = min(
+        1.0,
+        float(effective_feather) / float(requested_feather),
+        float(joint_parameter_scale),
+    )
+    return {
+        "arc_lateral_center_px": round(float(lateral_center), 3),
+        "arc_radius_px": round(float(boundary_radius), 3),
+        "arc_canvas_sagitta_px": round(
+            max(0.0, float(boundary_radius) - normal_center),
+            3,
+        ),
+        "arc_contact_sagitta_px": round(float(contact_sagitta), 3),
+        "arc_support_sagitta_px": round(float(contact_sagitta), 3),
+        "arc_max_depth_px": int(np.ceil(normal_center)),
+        "arc_component_pixels": int(np.count_nonzero(owned_band)),
+        "arc_parameter_scale": round(float(parameter_scale), 6),
+        "arc_effective_hard_zero_px": round(
+            float(effective_hard_zero), 3
+        ),
+        "arc_effective_feather_px": round(float(effective_feather), 3),
+        "arc_completion_limit_px": round(float(normal_center), 3),
+        "arc_paired_opposite": True,
+        "arc_support_profile": "seeded_shared_radial_band",
+        "paired_circle_center_px": [
+            round(float(center_x), 3),
+            round(float(center_y), 3),
+        ],
+        "paired_circle_boundary_radius_px": round(
+            float(boundary_radius), 3
+        ),
+        "paired_circle_half_alpha_radius_px": round(
+            float(half_alpha_radius), 3
+        ),
+        "paired_circle_seeded_band_components": int(seed_labels.size),
+        "paired_requested_feather_px": round(float(requested_feather), 3),
+        "paired_effective_feather_px": round(float(effective_feather), 3),
+        "paired_perceptual_feather_cap_px": round(
+            float(perceptual_cap), 3
+        ),
+        "paired_available_radial_p25_px": round(float(radial_p25), 3),
+        "paired_available_radial_p50_px": round(float(radial_p50), 3),
+        "paired_available_radial_p75_px": round(float(radial_p75), 3),
+        "paired_available_radial_side_p50_px": [
+            round(float(value), 3) for value in side_radial_p50
+        ],
+        "paired_joint_parameter_scale": round(
+            float(joint_parameter_scale), 6
+        ),
+        "paired_circle_field_once": True,
+    }
+
+
 def _corner_gap(side, segment, corner, height, width):
     start, end = segment["start"], segment["end"]
     if side in ("top", "bottom"):
@@ -1903,6 +2333,125 @@ def build_adaptive_edge_guard(
             span_threshold,
             run_extension,
         )
+
+    # Restored cutouts can carry one nearly uniform, very weak Alpha row
+    # around an otherwise opaque component.  When that residue spans almost
+    # a full canvas edge it is evidence of the restore halo, not of the subject
+    # crossing that edge.  Mark only that uniform run and equal-alpha corner
+    # continuations.  Do not mark the whole connected component: a separate,
+    # genuinely cropped semi-transparent part may belong to the same component.
+    weak_halo_limit = max(
+        64.0 / 255.0,
+        min(0.25, 4.0 * span_threshold),
+    )
+    weak_halo_sources = []
+    for candidates in candidate_segments_by_side.values():
+        for candidate in candidates:
+            candidate["weak_restore_halo_run"] = False
+    for side, candidates in candidate_segments_by_side.items():
+        oriented_alpha = _oriented_full_alpha(alpha, side)
+        oriented_labels = _oriented_full_alpha(labels, side)
+        side_length = oriented_alpha.shape[1]
+        for candidate in candidates:
+            start = max(0, int(candidate["seed_start"]))
+            end = min(side_length - 1, int(candidate["seed_end"]))
+            if end < start or (end - start + 1) / float(side_length) < 0.80:
+                continue
+            component_id = int(candidate["component_id"])
+            border_values = oriented_alpha[0, start : end + 1]
+            component_border = (
+                oriented_labels[0, start : end + 1] == component_id
+            )
+            border_values = border_values[component_border]
+            component_values = alpha[labels == component_id]
+            if not border_values.size or not component_values.size:
+                continue
+            border_p10, border_p90 = np.percentile(
+                border_values,
+                (10.0, 90.0),
+            ).tolist()
+            border_peak = float(np.max(border_values))
+            component_peak = float(np.max(component_values))
+            if (
+                border_peak > span_threshold + 1.0e-6
+                and border_peak < weak_halo_limit
+                and border_p90 - border_p10 <= 1.0 / 255.0
+                and component_peak >= max(0.5, 2.0 * border_peak)
+            ):
+                halo_alpha = float(np.median(border_values))
+                candidate["weak_restore_halo_run"] = True
+                candidate["weak_restore_halo_alpha"] = halo_alpha
+                weak_halo_sources.append(
+                    {
+                        "side": side,
+                        "component_id": component_id,
+                        "alpha": halo_alpha,
+                    }
+                )
+
+    # A full-edge halo necessarily leaves a short run at each adjacent canvas
+    # corner.  Suppress only those literal continuations when their Alpha is
+    # equally weak and equally uniform.  Requiring a shared corner prevents a
+    # source edge from hiding an unrelated true cut farther along another edge.
+    adjacent_corner_endpoint = {
+        ("top", "left"): "start",
+        ("top", "right"): "start",
+        ("bottom", "left"): "end",
+        ("bottom", "right"): "end",
+        ("left", "top"): "start",
+        ("left", "bottom"): "start",
+        ("right", "top"): "end",
+        ("right", "bottom"): "end",
+    }
+    halo_alpha_tolerance = 1.0 / 255.0
+    for side, candidates in candidate_segments_by_side.items():
+        oriented_alpha = _oriented_full_alpha(alpha, side)
+        oriented_labels = _oriented_full_alpha(labels, side)
+        side_length = oriented_alpha.shape[1]
+        for candidate in candidates:
+            if candidate["weak_restore_halo_run"]:
+                continue
+            component_id = int(candidate["component_id"])
+            start = max(0, int(candidate["seed_start"]))
+            end = min(side_length - 1, int(candidate["seed_end"]))
+            if end < start:
+                continue
+            border_values = oriented_alpha[0, start : end + 1]
+            component_border = (
+                oriented_labels[0, start : end + 1] == component_id
+            )
+            border_values = border_values[component_border]
+            if not border_values.size:
+                continue
+            border_p10, border_p90 = np.percentile(
+                border_values,
+                (10.0, 90.0),
+            ).tolist()
+            border_alpha = float(np.median(border_values))
+            if (
+                border_p90 - border_p10 > halo_alpha_tolerance
+                or float(np.max(border_values)) >= weak_halo_limit
+            ):
+                continue
+            for source in weak_halo_sources:
+                endpoint = adjacent_corner_endpoint.get(
+                    (source["side"], side)
+                )
+                if endpoint is None or component_id != source["component_id"]:
+                    continue
+                touches_shared_corner = (
+                    start == 0
+                    if endpoint == "start"
+                    else end == side_length - 1
+                )
+                if (
+                    touches_shared_corner
+                    and abs(border_alpha - source["alpha"])
+                    <= halo_alpha_tolerance
+                ):
+                    candidate["weak_restore_halo_run"] = True
+                    candidate["weak_restore_halo_alpha"] = source["alpha"]
+                    break
 
     balanced_frames = _balanced_frame_flush_evidence(
         alpha,
@@ -2261,6 +2810,50 @@ def build_adaptive_edge_guard(
             contact["component_pixels"] = component_pixels
             contact["consumed"] = True
 
+    paired_groups = {}
+    for side in ("top", "right", "bottom", "left"):
+        for contact in contacts_by_side[side]:
+            paired_group = contact.get("_paired_group")
+            if paired_group is None or contact["consumed"]:
+                continue
+            paired_groups.setdefault(int(paired_group), []).append(
+                (side, contact)
+            )
+    for paired_contacts in paired_groups.values():
+        if len(paired_contacts) != 2:
+            continue
+        component_id = int(paired_contacts[0][1]["component_id"])
+        if any(
+            int(contact["component_id"]) != component_id
+            for _, contact in paired_contacts
+        ):
+            continue
+        pair_spatial_ownership = _spatial_seed_ownership(
+            alpha.shape,
+            [contact for _, contact in paired_contacts],
+            ownership_skipped_candidates,
+            component_id,
+            ownership_blend,
+        )
+        paired_diagnostics = _multiply_shared_opposite_circle_guard(
+            guard,
+            alpha,
+            paired_contacts,
+            hard_zero,
+            max(contact["feather_px"] for _, contact in paired_contacts),
+            edge_probe,
+            labels,
+            component_id,
+            pair_spatial_ownership,
+        )
+        for _, contact in paired_contacts:
+            contact["mode"] = "paired_circle_arc"
+            contact.update(paired_diagnostics)
+            contact["component_pixels"] = paired_diagnostics[
+                "arc_component_pixels"
+            ]
+            contact["consumed"] = True
+
     contacts = []
     for side in ("top", "right", "bottom", "left"):
         for contact in contacts_by_side[side]:
@@ -2314,6 +2907,7 @@ def build_adaptive_edge_guard(
                         spatial_ownership,
                     )
             contact.pop("_lateral_ownership", None)
+            contact.pop("_paired_group", None)
             contact.pop("consumed", None)
             contacts.append(contact)
 
@@ -2510,7 +3104,7 @@ class GameUGCAdaptiveEdgeFade:
                         "min": 0.001,
                         "max": 0.5,
                         "step": 0.001,
-                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。窄弦双向扩张即使形成深宽度平台仍属于不可判贴边并保持不变；同一主体上匹配的左右／上下大段裁断会成对使用同一围合趋势的镜像圆弧羽化。",
+                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。窄弦双向扩张即使形成深宽度平台仍属于不可判贴边并保持不变；同一主体上匹配的左右／上下大段裁断会共用一个画布中心径向圆场，并按触边分支厚度自适应收窄羽化。",
                     },
                 ),
                 "rgb_cleanup_alpha": (
