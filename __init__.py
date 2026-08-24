@@ -10,7 +10,8 @@ except ImportError:  # 允许仓库测试在未安装 ComfyUI/Torch 的 Python �
     torch = None
 
 
-NODE_VERSION = "v0.2.3"
+NODE_VERSION = "v0.2.4"
+DIAGNOSTICS_SCHEMA = "clip_evidence_v6"
 REFERENCE_SIZE = 1280
 LARGE_ICON_SIZE = 1280
 SMALL_ICON_SIZE = 168
@@ -926,6 +927,54 @@ def _interval_distance(coordinates, start, end):
     )
 
 
+def _is_adjacent_micro_ownership_fringe(
+    skipped,
+    contacts_by_side,
+    maximum_length,
+    maximum_gap,
+):
+    """Return true only for a tiny antialiased tail of a confirmed edge run.
+
+    Candidate extraction can split the one-pixel antialias transition next to
+    a solid clipped run into its own skipped candidate.  Treating that pixel as
+    an independent ownership seed creates an artificial hard line one pixel
+    before the confirmed run.  It is safe to absorb only when the skipped run
+    is tiny, has no robust border core, is immediately adjacent on the same
+    side/component, and its inward probe span overlaps the confirmed run.
+    """
+    if skipped.get("reason") not in {
+        "antialiased_touch",
+        "actual_border_empty",
+    }:
+        return False
+    if int(skipped.get("length", 0)) > int(maximum_length):
+        return False
+    if int(skipped.get("robust_border_run_px", 0)) > 0:
+        return False
+
+    side = skipped.get("side")
+    component_id = skipped.get("component_id")
+    skipped_start = int(skipped["start"])
+    skipped_end = int(skipped["end"])
+    span_start = int(skipped.get("span_start", skipped_start))
+    span_end = int(skipped.get("span_end", skipped_end))
+    for contact in contacts_by_side.get(side, []):
+        if contact.get("component_id") != component_id:
+            continue
+        if skipped_end < int(contact["start"]):
+            gap = int(contact["start"]) - skipped_end - 1
+        elif skipped_start > int(contact["end"]):
+            gap = skipped_start - int(contact["end"]) - 1
+        else:
+            gap = 0
+        if gap > int(maximum_gap):
+            continue
+        if span_end < int(contact["start"]) or span_start > int(contact["end"]):
+            continue
+        return True
+    return False
+
+
 def _lateral_ownership_profile(
     side_length,
     confirmed_start,
@@ -1379,7 +1428,13 @@ def _multiply_wide_circle_arc_guard(
     lower = max(0, int(start) - lateral_padding)
     upper = min(side_length - 1, int(end) + lateral_padding)
     lateral = np.arange(lower, upper + 1, dtype=np.float32)
-    support = _hard_inset_weight(lateral, start, end, lateral_padding)
+    support = _hard_inset_weight(
+        lateral,
+        start,
+        end,
+        lateral_padding,
+    )
+    support_profile = "curved_depth_taper"
 
     requested_hard_zero = float(hard_zero)
     requested_feather = float(feather)
@@ -1514,14 +1569,39 @@ def _multiply_wide_circle_arc_guard(
                 lower : upper + 1, width - max_depth :
             ]
         component_2d = component_2d * ownership_2d
+    # The lateral support controls how far the circle may travel inward; it
+    # must not scale the circle's opacity.  Opacity scaling creates a constant
+    # gray strip throughout the normal direction at each support value, so the
+    # endpoint contours terminate as a rectangle even though the underlying
+    # signed-distance field is circular.  Contracting the virtual inward
+    # coordinate instead makes every contour curl continuously back to the
+    # boundary.  Cap at the circle center so a tiny support value cannot cross
+    # to the far half of the virtual circle and darken again.
+    active_support = support_2d > 1.0e-6
+    virtual_inward = np.minimum(
+        inward / np.maximum(support_2d, 1.0e-6),
+        float(radius),
+    )
     radial_distance = np.sqrt(
-        offset * offset + (float(radius) - inward) ** 2
+        offset * offset + (float(radius) - virtual_inward) ** 2
     )
     signed_inside = float(radius) - radial_distance
-    circle = _smootherstep(
+    circle = np.ones(local_shape, dtype=np.float32)
+    circle[active_support] = _smootherstep(
         (signed_inside - effective_hard_zero) / effective_feather
+    )[active_support]
+    actual_segment = (
+        (lateral >= float(start)) & (lateral <= float(end))
     )
-    local = 1.0 - support_2d * component_2d * (1.0 - circle)
+    if side in ("top", "bottom"):
+        actual_segment = actual_segment[None, :]
+    else:
+        actual_segment = actual_segment[:, None]
+    safety_core = np.broadcast_to(actual_segment, local_shape) & (
+        inward <= effective_hard_zero
+    )
+    circle[safety_core] = 0.0
+    local = 1.0 - component_2d * (1.0 - circle)
 
     contact_offset = max(
         abs(float(start) - float(center)),
@@ -1556,6 +1636,7 @@ def _multiply_wide_circle_arc_guard(
         "arc_effective_feather_px": round(float(effective_feather), 3),
         "arc_completion_limit_px": round(float(completion_limit), 3),
         "arc_paired_opposite": bool(paired_opposite),
+        "arc_support_profile": support_profile,
     }
 
 
@@ -1906,10 +1987,27 @@ def build_adaptive_edge_guard(
                 }
             )
 
+    ownership_fringe_limit = max(1, int(round(2 * scale)))
+    ownership_fringe_gap = max(1, int(round(1 * scale)))
+    ownership_skipped_candidates = []
+    for skipped in skipped_candidates:
+        if _is_adjacent_micro_ownership_fringe(
+            skipped,
+            contacts_by_side,
+            ownership_fringe_limit,
+            ownership_fringe_gap,
+        ):
+            skipped["ownership_role"] = "absorbed_micro_fringe"
+        else:
+            skipped["ownership_role"] = "blocking_seed"
+            ownership_skipped_candidates.append(skipped)
+
     for side in ("top", "right", "bottom", "left"):
         side_length = width if side in ("top", "bottom") else height
         side_skips = [
-            item for item in skipped_candidates if item["side"] == side
+            item
+            for item in ownership_skipped_candidates
+            if item["side"] == side
         ]
         merged_contacts = []
         for contact in sorted(contacts_by_side[side], key=lambda item: item["start"]):
@@ -2013,7 +2111,7 @@ def build_adaptive_edge_guard(
         for contact in contacts_by_side[side]:
             skipped_ranges = [
                 (item["start"], item["end"])
-                for item in skipped_candidates
+                for item in ownership_skipped_candidates
                 if item["side"] == side
                 and item.get("component_id") == contact["component_id"]
             ]
@@ -2133,7 +2231,7 @@ def build_adaptive_edge_guard(
         corner_spatial_ownership = _spatial_seed_ownership(
             alpha.shape,
             [horizontal, vertical],
-            skipped_candidates,
+            ownership_skipped_candidates,
             horizontal["component_id"],
             ownership_blend,
         )
@@ -2170,7 +2268,7 @@ def build_adaptive_edge_guard(
                 spatial_ownership = _spatial_seed_ownership(
                     alpha.shape,
                     [contact],
-                    skipped_candidates,
+                    ownership_skipped_candidates,
                     contact["component_id"],
                     ownership_blend,
                 )
@@ -2485,7 +2583,7 @@ class GameUGCAdaptiveEdgeFade:
                 {
                     "batch": batch_index,
                     "node_version": NODE_VERSION,
-                    "diagnostics_schema": "clip_evidence_v5",
+                    "diagnostics_schema": DIAGNOSTICS_SCHEMA,
                     "input_size": [int(image.shape[1]), int(image.shape[0])],
                     "contacts": contacts,
                     "skipped_candidates": skipped_candidates,
