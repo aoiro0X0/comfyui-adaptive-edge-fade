@@ -10,8 +10,8 @@ except ImportError:  # 允许仓库测试在未安装 ComfyUI/Torch 的 Python �
     torch = None
 
 
-NODE_VERSION = "v0.2.6"
-DIAGNOSTICS_SCHEMA = "clip_evidence_v8"
+NODE_VERSION = "v0.2.7"
+DIAGNOSTICS_SCHEMA = "clip_evidence_v9"
 REFERENCE_SIZE = 1280
 LARGE_ICON_SIZE = 1280
 SMALL_ICON_SIZE = 168
@@ -1719,6 +1719,66 @@ def _expanded_contact_safety_segments(contacts):
     return result
 
 
+def _side_activation_diagnostics(contacts, height, width):
+    """Summarize the four side-level activation decisions.
+
+    Detection contacts remain useful evidence records, but v0.2.7 applies one
+    geometry field per side.  Keep a complete four-side summary so an inactive
+    side is explicit rather than merely absent from ``contacts``.
+    """
+    contacts_by_side = {
+        side: [] for side in ("top", "right", "bottom", "left")
+    }
+    for contact in contacts:
+        side = contact.get("side")
+        if side in contacts_by_side:
+            contacts_by_side[side].append(contact)
+
+    diagnostics = []
+    for side in ("top", "right", "bottom", "left"):
+        side_contacts = contacts_by_side[side]
+        side_length = width if side in ("top", "bottom") else height
+        source_segments = _expanded_contact_safety_segments(side_contacts)
+        intervals = sorted(
+            (int(segment["start"]), int(segment["end"]))
+            for segment in source_segments
+        )
+        merged_intervals = []
+        for start, end in intervals:
+            start = max(0, min(int(side_length) - 1, start))
+            end = max(start, min(int(side_length) - 1, end))
+            if not merged_intervals or start > merged_intervals[-1][1] + 1:
+                merged_intervals.append([start, end])
+            else:
+                merged_intervals[-1][1] = max(
+                    merged_intervals[-1][1],
+                    end,
+                )
+        covered_pixels = sum(
+            end - start + 1 for start, end in merged_intervals
+        )
+        active = bool(side_contacts)
+        diagnostics.append(
+            {
+                "side": side,
+                "active": active,
+                "confirmed_contact_count": int(len(side_contacts)),
+                "confirmed_source_segments": merged_intervals,
+                "aggregate_border_fraction": round(
+                    covered_pixels / float(max(1, side_length)),
+                    6,
+                ),
+                "mode": "side_circle_arc" if active else "none",
+                "side_field_combination": (
+                    "normalized_active_edge_partition"
+                    if active
+                    else "none"
+                ),
+            }
+        )
+    return diagnostics
+
+
 def _multiply_wide_circle_arc_guard(
     guard,
     alpha,
@@ -1739,17 +1799,15 @@ def _multiply_wide_circle_arc_guard(
     robust_end=None,
     safety_contacts=None,
     safety_spatial_ownership=None,
+    all_visible_alpha=False,
 ):
     """Multiply one edge-seeded full-canvas circle transition band.
 
-    Detection remains local to the confirmed border run, but the smooth
-    circle field is evaluated across the whole canvas.  The confirmed seed
-    first selects its complete 8-connected visible component; that component
-    is then intersected with the active circle transition.  A low branch
-    connected to the crop (for example an arm beside a clipped torso)
-    therefore shares the same fade even if its shoulder connection is high,
-    while the high branch itself lies outside the active band and a
-    disconnected object is excluded by the component label.
+    Detection remains local to confirmed border evidence, but the smooth
+    circle field is evaluated across the whole canvas.  v0.2.7 calls this once
+    per activated side with ``all_visible_alpha=True``: every visible pixel in
+    that side's near-circle band shares one field, regardless of component.
+    The older component-seeded path is retained for direct/internal callers.
     """
     height, width = guard.shape
     side_length = width if side in ("top", "bottom") else height
@@ -1846,7 +1904,20 @@ def _multiply_wide_circle_arc_guard(
             }
         ]
 
-    if component_labels is not None and component_id is not None:
+    if all_visible_alpha:
+        component = np.asarray(alpha, dtype=np.float32) >= float(
+            outer_threshold
+        )
+        if component_labels is not None:
+            seeded_component_ids = np.unique(
+                np.asarray(component_labels, dtype=np.int32)[component]
+            )
+            seeded_component_ids = seeded_component_ids[
+                seeded_component_ids > 0
+            ].astype(np.int32, copy=False)
+        else:
+            seeded_component_ids = np.empty(0, dtype=np.int32)
+    elif component_labels is not None and component_id is not None:
         component = component_labels == int(component_id)
         seeded_component_ids = np.asarray(
             [int(component_id)], dtype=np.int32
@@ -1987,6 +2058,7 @@ def _multiply_wide_circle_arc_guard(
             int(value) for value in seeded_component_ids.tolist()
         ],
         "arc_seed_contact_count": int(len(safety_contacts)),
+        "arc_all_visible_alpha": bool(all_visible_alpha),
         "arc_transition_band_pixels": int(
             np.count_nonzero(owned_oriented_band)
         ),
@@ -2558,7 +2630,7 @@ def _corner_segments_connected(
 def build_adaptive_edge_guard(
     alpha,
     safety_inset=8,
-    feather_width=240,
+    feather_width=160,
     contact_threshold=0.03,
     return_skipped=False,
 ):
@@ -2912,444 +2984,163 @@ def build_adaptive_edge_guard(
             )
         contacts_by_side[side] = merged_contacts
 
-    _promote_paired_opposite_arcs(
-        contacts_by_side,
-        alpha,
-        labels,
-        span_threshold,
-        scan_band,
+    # v0.2.7 promotes the final geometry decision from individual runs and
+    # components to the canvas side.  Evidence remains per contact, but one
+    # confirmed contact activates exactly one shared true-circle field for
+    # that side.  Every visible Alpha pixel in the side's near band joins the
+    # field—including a torso between two clipped legs or an independent coin.
+    # An inactive side never writes the guard.
+    evidence_contacts = [
+        contact
+        for side in ("top", "right", "bottom", "left")
+        for contact in contacts_by_side[side]
+    ]
+    activation_records = _side_activation_diagnostics(
+        evidence_contacts,
         height,
         width,
-        base_feather,
     )
+    activation_by_side = {
+        record["side"]: record for record in activation_records
+    }
 
-    # A medium crop remains bowed unless its *same seeded component* has a
-    # meaningful low branch outside the old local support.  In that specific
-    # case the branch must share the full-circle transition or the support
-    # boundary becomes a visible split through the subject.
+    contacts = []
+    side_guards = {}
+    opposite_side = {
+        "top": "bottom",
+        "right": "left",
+        "bottom": "top",
+        "left": "right",
+    }
     for side in ("top", "right", "bottom", "left"):
-        for contact in contacts_by_side[side]:
-            same_side_component_contacts = sum(
-                int(other["component_id"]) == int(contact["component_id"])
-                for other in contacts_by_side[side]
-            )
-            contact["seeded_circle_scope"] = bool(
-                contact["wide"]
-                or (
-                    contact["fraction"] >= 0.14
-                    and same_side_component_contacts == 1
-                    and _needs_seeded_circle_scope(
-                        labels,
-                        contact["component_id"],
-                        side,
-                        contact,
-                        hard_zero,
-                        contact["feather_px"],
-                        lateral_padding,
-                    )
-                )
-            )
-
-    ownership_blend = max(1, int(round(12 * scale)))
-    # Single full-circle ownership is itself visible in the final alpha.  The
-    # former canonical 12px Voronoi blend produced only about 6px of actual
-    # confirmed-to-skip transition (distance delta changes from both sides),
-    # which collapses below one pixel at 168px.  Give this field a perceptual
-    # width tied to the requested feather while leaving every no-skip case and
-    # all corner/paired/bowed ownership unchanged.
-    single_circle_ownership_blend = max(
-        1,
-        int(round(64 * scale)),
-        int(round(0.4 * base_feather)),
-    )
-    for side in ("top", "right", "bottom", "left"):
+        side_contacts = contacts_by_side[side]
+        if not side_contacts:
+            continue
         side_length = width if side in ("top", "bottom") else height
-        for contact in contacts_by_side[side]:
-            skipped_ranges = [
-                (item["start"], item["end"])
-                for item in ownership_skipped_candidates
-                if item["side"] == side
-                and item.get("component_id") == contact["component_id"]
-            ]
-            contact["_lateral_ownership"] = _lateral_ownership_profile(
-                side_length,
-                contact["start"],
-                contact["end"],
-                skipped_ranges,
-                ownership_blend,
-            )
-
-    corner_pairs = {
-        "top_left": ("top", "left"),
-        "top_right": ("top", "right"),
-        "bottom_right": ("bottom", "right"),
-        "bottom_left": ("bottom", "left"),
-    }
-    valid_corner_candidates = []
-    for corner, (horizontal_side, vertical_side) in corner_pairs.items():
-        for horizontal in contacts_by_side[horizontal_side]:
-            if (
-                horizontal["length"] > corner_length_limit
-                or horizontal.get("paired_opposite_arc")
-            ):
-                continue
-            horizontal_gap = _corner_gap(
-                horizontal_side, horizontal, corner, height, width
-            )
-            if horizontal_gap > corner_snap:
-                continue
-            for vertical in contacts_by_side[vertical_side]:
-                if horizontal["component_id"] != vertical["component_id"]:
-                    continue
-                if (
-                    vertical["length"] > corner_length_limit
-                    or vertical.get("paired_opposite_arc")
-                ):
-                    continue
-                vertical_gap = _corner_gap(
-                    vertical_side, vertical, corner, height, width
-                )
-                if vertical_gap > corner_snap:
-                    continue
-                corner_feather = max(
-                    horizontal["feather_px"], vertical["feather_px"]
-                )
-                axis_x = max(
-                    hard_zero + corner_feather + 1,
-                    _corner_extent(
-                        horizontal_side, horizontal, corner, height, width
+        safety_segments = _expanded_contact_safety_segments(side_contacts)
+        activation = activation_by_side[side]
+        side_feather = max(
+            1,
+            int(
+                round(
+                    base_feather
+                    * _wide_multiplier(
+                        activation["aggregate_border_fraction"]
                     )
-                    + lateral_padding
-                    + 1,
                 )
-                axis_y = max(
-                    hard_zero + corner_feather + 1,
-                    _corner_extent(
-                        vertical_side, vertical, corner, height, width
-                    )
-                    + lateral_padding
-                    + 1,
-                )
-                axis_x = min(width, int(axis_x))
-                axis_y = min(height, int(axis_y))
-                if not _corner_segments_connected(
-                    alpha,
-                    corner,
-                    horizontal_side,
-                    horizontal,
-                    vertical_side,
-                    vertical,
-                    axis_x,
-                    axis_y,
-                    edge_probe,
-                    outer_threshold,
-                    connectivity_threshold,
-                ):
-                    continue
-                valid_corner_candidates.append(
-                    {
-                        "corner": corner,
-                        "horizontal_side": horizontal_side,
-                        "vertical_side": vertical_side,
-                        "horizontal": horizontal,
-                        "vertical": vertical,
-                        "axis_x": axis_x,
-                        "axis_y": axis_y,
-                    }
-                )
-
-    # A contact that can pair with more than one corner has no rotation-stable
-    # winner.  Keep every such candidate as independent edge fields instead of
-    # letting the fixed corner iteration order choose an arbitrary ellipse.
-    corner_participation = {}
-    for candidate in valid_corner_candidates:
-        for contact in (candidate["horizontal"], candidate["vertical"]):
-            identifier = id(contact)
-            corner_participation[identifier] = (
-                corner_participation.get(identifier, 0) + 1
-            )
-    for candidate in valid_corner_candidates:
-        horizontal = candidate["horizontal"]
-        vertical = candidate["vertical"]
-        if (
-            corner_participation[id(horizontal)] != 1
-            or corner_participation[id(vertical)] != 1
-        ):
-            horizontal["corner_merge_skipped"] = "ambiguous_multi_corner"
-            vertical["corner_merge_skipped"] = "ambiguous_multi_corner"
-            continue
-
-        corner = candidate["corner"]
-        horizontal_side = candidate["horizontal_side"]
-        vertical_side = candidate["vertical_side"]
-        axis_x = candidate["axis_x"]
-        axis_y = candidate["axis_y"]
-        corner_spatial_ownership = _spatial_seed_ownership(
-            alpha.shape,
-            [horizontal, vertical],
-            ownership_skipped_candidates,
-            horizontal["component_id"],
-            ownership_blend,
+            ),
         )
-        component_pixels = _multiply_corner_guard(
-            guard,
-            alpha,
-            corner,
-            horizontal_side,
-            horizontal,
-            vertical_side,
-            vertical,
-            axis_x,
-            axis_y,
-            hard_zero,
-            edge_probe,
-            outer_threshold,
-            labels,
-            horizontal["component_id"],
-            horizontal["_lateral_ownership"],
-            vertical["_lateral_ownership"],
-            corner_spatial_ownership,
-        )
-        for contact in (horizontal, vertical):
-            contact["mode"] = "corner_ellipse"
-            contact["corner"] = corner
-            contact["corner_axis_px"] = [int(axis_x), int(axis_y)]
-            contact["component_pixels"] = component_pixels
-            contact["consumed"] = True
-
-    paired_groups = {}
-    for side in ("top", "right", "bottom", "left"):
-        for contact in contacts_by_side[side]:
-            paired_group = contact.get("_paired_group")
-            if paired_group is None or contact["consumed"]:
-                continue
-            paired_groups.setdefault(int(paired_group), []).append(
-                (side, contact)
-            )
-    for paired_contacts in paired_groups.values():
-        if len(paired_contacts) != 2:
-            continue
-        component_id = int(paired_contacts[0][1]["component_id"])
-        if any(
-            int(contact["component_id"]) != component_id
-            for _, contact in paired_contacts
-        ):
-            continue
-        pair_spatial_ownership = _spatial_seed_ownership(
-            alpha.shape,
-            [contact for _, contact in paired_contacts],
-            ownership_skipped_candidates,
-            component_id,
-            ownership_blend,
-        )
-        paired_diagnostics = _multiply_shared_opposite_circle_guard(
-            guard,
-            alpha,
-            paired_contacts,
-            hard_zero,
-            max(contact["feather_px"] for _, contact in paired_contacts),
-            edge_probe,
-            labels,
-            component_id,
-            pair_spatial_ownership,
-        )
-        for _, contact in paired_contacts:
-            contact["mode"] = "paired_circle_arc"
-            contact.update(paired_diagnostics)
-            contact["component_pixels"] = paired_diagnostics[
-                "arc_component_pixels"
-            ]
-            contact["consumed"] = True
-
-    # Once one confirmed run owns a seeded full-circle field, every remaining
-    # confirmed run on that same side/component joins the same field—even a
-    # medium or narrow run.  Letting such a run fall through to a later bowed
-    # pass would square part of the guard and create a darker seam.  All real
-    # source runs remain separate safety-inset seeds and diagnostics, but the
-    # smooth transition is written only once.
-    single_edge_groups = {}
-    for side in ("top", "right", "bottom", "left"):
-        for contact in contacts_by_side[side]:
-            if (
-                contact["consumed"]
-                or contact.get("paired_opposite_arc")
-            ):
-                continue
-            key = (side, int(contact["component_id"]))
-            single_edge_groups.setdefault(key, []).append(contact)
-    single_wide_groups = {
-        key: contacts
-        for key, contacts in single_edge_groups.items()
-        if any(contact["seeded_circle_scope"] for contact in contacts)
-    }
-    for (side, component_id), wide_contacts in single_wide_groups.items():
-        seeded_owners = [
-            contact
-            for contact in wide_contacts
-            if contact["seeded_circle_scope"]
-        ]
-        seeded_owner_ids = {id(contact) for contact in seeded_owners}
-        safety_segments = _expanded_contact_safety_segments(wide_contacts)
-        group_spatial_ownership = _single_wide_spatial_seed_ownership(
-            alpha.shape,
-            safety_segments,
-            ownership_skipped_candidates,
-            component_id,
-            single_circle_ownership_blend,
-            hard_zero,
-            single_circle_ownership_blend,
-        )
+        side_guard = np.ones_like(guard, dtype=np.float32)
         arc_diagnostics = _multiply_wide_circle_arc_guard(
-            guard,
+            side_guard,
             alpha,
             side,
-            min(contact["start"] for contact in wide_contacts),
-            max(contact["end"] for contact in wide_contacts),
+            min(segment["start"] for segment in safety_segments),
+            max(segment["end"] for segment in safety_segments),
             hard_zero,
-            max(contact["feather_px"] for contact in wide_contacts),
+            side_feather,
             lateral_padding,
             edge_probe,
             outer_threshold,
-            labels,
-            component_id,
-            None,
-            group_spatial_ownership,
-            False,
+            component_labels=labels,
+            component_id=None,
+            lateral_ownership=None,
+            spatial_ownership=None,
+            paired_opposite=bool(
+                contacts_by_side[opposite_side[side]]
+            ),
             safety_contacts=safety_segments,
-            safety_spatial_ownership=group_spatial_ownership,
+            safety_spatial_ownership=None,
+            all_visible_alpha=True,
         )
-        for contact in wide_contacts:
-            contact["legacy_support_start"] = int(
-                contact["support_start"]
-            )
+        side_guards[side] = side_guard
+        for contact in side_contacts:
+            contact["legacy_support_start"] = int(contact["support_start"])
             contact["legacy_support_end"] = int(contact["support_end"])
             contact["support_start"] = 0
-            contact["support_end"] = int(
-                width - 1 if side in ("top", "bottom") else height - 1
+            contact["support_end"] = int(side_length - 1)
+            contact["requested_local_feather_px"] = int(
+                contact["feather_px"]
             )
-            contact["seeded_circle_group_member"] = True
-            contact["seeded_circle_group_owner"] = bool(
-                id(contact) in seeded_owner_ids
+            contact["feather_px"] = int(side_feather)
+            contact["mode"] = "side_circle_arc"
+            contact["side_active"] = True
+            contact["side_field_contact_count"] = int(len(side_contacts))
+            contact["side_field_source_segment_count"] = int(
+                len(safety_segments)
             )
-            contact["single_circle_ownership_blend_px"] = int(
-                single_circle_ownership_blend
+            contact["side_component_scope"] = "all_visible_near_edge"
+            contact["side_field_combination"] = (
+                "normalized_active_edge_partition"
             )
-            contact["single_circle_opacity_anchor_depth_px"] = int(
-                single_circle_ownership_blend
-            )
-            contact["single_circle_safety_ownership_blend_px"] = int(
-                single_circle_ownership_blend
-            )
-            contact["single_circle_safety_ownership_mode"] = (
-                "continuous_capsule_shared_with_opacity"
-            )
-            contact["mode"] = "wide_circle_arc"
             contact.update(arc_diagnostics)
             contact["component_pixels"] = arc_diagnostics[
                 "arc_component_pixels"
             ]
-            contact["consumed"] = True
-
-    contacts = []
-    for side in ("top", "right", "bottom", "left"):
-        for contact in contacts_by_side[side]:
-            if not contact["consumed"]:
-                if contact["seeded_circle_scope"]:
-                    safety_segments = _expanded_contact_safety_segments(
-                        [contact]
-                    )
-                    spatial_ownership = _single_wide_spatial_seed_ownership(
-                        alpha.shape,
-                        safety_segments,
-                        ownership_skipped_candidates,
-                        contact["component_id"],
-                        single_circle_ownership_blend,
-                        hard_zero,
-                        single_circle_ownership_blend,
-                    )
-                    arc_diagnostics = _multiply_wide_circle_arc_guard(
-                        guard,
-                        alpha,
-                        side,
-                        contact["start"],
-                        contact["end"],
-                        hard_zero,
-                        contact["feather_px"],
-                        lateral_padding,
-                        edge_probe,
-                        outer_threshold,
-                        labels,
-                        contact["component_id"],
-                        None,
-                        spatial_ownership,
-                        bool(contact.get("paired_opposite_arc")),
-                        contact.get("robust_global_start"),
-                        contact.get("robust_global_end"),
-                        safety_segments,
-                        spatial_ownership,
-                    )
-                    contact["mode"] = (
-                        "paired_circle_arc"
-                        if contact.get("paired_opposite_arc")
-                        else "wide_circle_arc"
-                    )
-                    contact.update(arc_diagnostics)
-                    if contact["mode"] == "wide_circle_arc":
-                        contact["legacy_support_start"] = int(
-                            contact["support_start"]
-                        )
-                        contact["legacy_support_end"] = int(
-                            contact["support_end"]
-                        )
-                        contact["support_start"] = 0
-                        contact["support_end"] = int(
-                            width - 1
-                            if side in ("top", "bottom")
-                            else height - 1
-                        )
-                        contact["seeded_circle_group_member"] = True
-                        contact["seeded_circle_group_owner"] = True
-                        contact["single_circle_ownership_blend_px"] = int(
-                            single_circle_ownership_blend
-                        )
-                        contact[
-                            "single_circle_opacity_anchor_depth_px"
-                        ] = int(single_circle_ownership_blend)
-                        contact[
-                            "single_circle_safety_ownership_blend_px"
-                        ] = int(single_circle_ownership_blend)
-                        contact["single_circle_safety_ownership_mode"] = (
-                            "continuous_capsule_shared_with_opacity"
-                        )
-                else:
-                    spatial_ownership = _spatial_seed_ownership(
-                        alpha.shape,
-                        [contact],
-                        ownership_skipped_candidates,
-                        contact["component_id"],
-                        ownership_blend,
-                    )
-                    contact["component_pixels"] = _multiply_bowed_edge_guard(
-                        guard,
-                        alpha,
-                        side,
-                        contact["start"],
-                        contact["end"],
-                        hard_zero,
-                        contact["feather_px"],
-                        lateral_padding,
-                        edge_probe,
-                        outer_threshold,
-                        labels,
-                        contact["component_id"],
-                        contact["_lateral_ownership"],
-                        spatial_ownership,
-                    )
+            contact.pop("consumed", None)
             contact.pop("_lateral_ownership", None)
             contact.pop("_paired_group", None)
-            contact.pop("consumed", None)
             contacts.append(contact)
 
+    # Blend active side fields with a smooth partition of unity.  Normalize
+    # only over active q weights: one active side therefore keeps its original
+    # circle exactly, and equal adjacent fields remain equal instead of being
+    # squared darker.  An inactive literal edge still has zero q from every
+    # active side.  Pixel-centre distances keep every q positive even on the
+    # outermost row/column, avoiding a one-pixel line where an active bottom
+    # field meets a different-component object on the literal left edge.
+    # Unlike pointwise minimum, the blend has no derivative crease along the
+    # equal-field diagonal.
+    y = np.arange(height, dtype=np.float64)[:, None]
+    x = np.arange(width, dtype=np.float64)[None, :]
+    vertical_denominator = float(max(1, height))
+    horizontal_denominator = float(max(1, width))
+    distance_top = (y + 0.5) / vertical_denominator
+    distance_bottom = (float(height) - y - 0.5) / vertical_denominator
+    distance_left = (x + 0.5) / horizontal_denominator
+    distance_right = (float(width) - x - 0.5) / horizontal_denominator
+    horizontal_pair = distance_left * distance_right
+    vertical_pair = distance_top * distance_bottom
+    weight_denominator = np.zeros((height, width), dtype=np.float64)
+    weighted_side_fade = np.zeros((height, width), dtype=np.float64)
+    for side, side_guard in side_guards.items():
+        if side == "top":
+            unnormalized_weight = horizontal_pair * distance_bottom
+        elif side == "right":
+            unnormalized_weight = vertical_pair * distance_left
+        elif side == "bottom":
+            unnormalized_weight = horizontal_pair * distance_top
+        else:
+            unnormalized_weight = vertical_pair * distance_right
+        weight_denominator += unnormalized_weight
+        weighted_side_fade += unnormalized_weight * (
+            1.0 - np.asarray(side_guard, dtype=np.float64)
+        )
+    combined_side_fade = np.zeros((height, width), dtype=np.float64)
+    np.divide(
+        weighted_side_fade,
+        weight_denominator,
+        out=combined_side_fade,
+        where=weight_denominator > np.finfo(np.float64).eps,
+    )
+
+    guard = (1.0 - combined_side_fade).astype(np.float32)
+
+    # The convex blend intentionally reserves weight for inactive sides and
+    # would otherwise dilute the safety core.  Restore exact-zero only on the
+    # original confirmed component and its real source intervals—never on an
+    # entire side or on a skipped/tangent component.
+    for side in ("top", "right", "bottom", "left"):
+        for contact in contacts_by_side[side]:
+            source_component = labels == int(contact["component_id"])
+            for segment in _expanded_contact_safety_segments([contact]):
+                _force_contact_safety_core(
+                    guard,
+                    source_component,
+                    side,
+                    segment,
+                    hard_zero,
+                )
     result = (np.clip(guard, 0.0, 1.0).astype(np.float32), contacts)
     if return_skipped:
         return (*result, skipped_candidates)
@@ -3360,7 +3151,7 @@ def apply_adaptive_edge_fade(
     rgb,
     alpha,
     safety_inset=8,
-    feather_width=240,
+    feather_width=160,
     contact_threshold=0.03,
     return_skipped=False,
 ):
@@ -3534,7 +3325,13 @@ class GameUGCAdaptiveEdgeFade:
                 ),
                 "feather_width": (
                     "INT",
-                    {"default": 240, "min": 8, "max": 640, "step": 1},
+                    {
+                        "default": 160,
+                        "min": 8,
+                        "max": 640,
+                        "step": 1,
+                        "tooltip": "圆弧过渡向画内延伸的基准宽度；自动管线推荐 160。数值越大，主体向内退得越深。",
+                    },
                 ),
                 "contact_threshold": (
                     "FLOAT",
@@ -3543,7 +3340,7 @@ class GameUGCAdaptiveEdgeFade:
                         "min": 0.001,
                         "max": 0.5,
                         "step": 0.001,
-                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。窄弦双向扩张即使形成深宽度平台仍属于不可判贴边并保持不变；同一主体上匹配的左右／上下大段裁断会共用一个画布中心径向圆场，并按触边分支厚度自适应收窄羽化。",
+                        "tooltip": "用于估计候选主体范围；最外低阈值只负责找候选，实际第 0 行／列还须通过连续实心宽度、约 12px 向内支撑与宽度持久性证据。任一真实裁断证据会激活所在画边的一整个共享圆弧场，该边近场内所有可见 Alpha 一起平滑退去；没有真实裁断证据的画边保持不变。",
                     },
                 ),
                 "rgb_cleanup_alpha": (
@@ -3569,7 +3366,7 @@ class GameUGCAdaptiveEdgeFade:
         rgba,
         final_alpha,
         safety_inset=8,
-        feather_width=240,
+        feather_width=160,
         contact_threshold=0.03,
         rgb_cleanup_alpha=0.06,
     ):
@@ -3619,6 +3416,11 @@ class GameUGCAdaptiveEdgeFade:
                     "diagnostics_schema": DIAGNOSTICS_SCHEMA,
                     "input_size": [int(image.shape[1]), int(image.shape[0])],
                     "contacts": contacts,
+                    "side_activations": _side_activation_diagnostics(
+                        contacts,
+                        int(image.shape[0]),
+                        int(image.shape[1]),
+                    ),
                     "skipped_candidates": skipped_candidates,
                 }
             )
